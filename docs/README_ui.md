@@ -70,13 +70,13 @@ The most normal task is keep it on `Relevant` and just make a query, which will 
 
 ![ui_6.png](ui_6.png)
 
-| Dropdown or Button or panel or text box | Purpose                                                          |
-|-----------------------------------------|------------------------------------------------------------------|
-| Select Subset of Document(s)            | Select documents to consider for query or summarization actions  |
-| Update UI with Document(s) from DB      | Update the drop-down in                                          |
-| Show Sources from DB                    | Show HTML links of sources in right panel                        |
-| Download File w/Sources                 | Download list of sources after clicking on "Update UI..." button |
-| Document Exceptions                     | Location where document ingestion failurse are located           |
+| Dropdown or Button or panel or text box | Purpose                                                                 |
+|-----------------------------------------|-------------------------------------------------------------------------|
+| Select Subset of Document(s)            | Select documents to consider for query or summarization actions         |
+| Update UI with Document(s) from DB      | Update the drop-down for selecting subset *and* Download File w/Sources |
+| Show Sources from DB                    | Show HTML links of sources in right panel                               |
+| Download File w/Sources                 | Download list of sources after clicking on "Update UI..." button        |
+| Document Exceptions                     | Location where document ingestion failurse are located                  |
 
 A normal task is to subset on just 1-2 documents, and make a query on those.
 
@@ -168,3 +168,15 @@ Requires admin password if in public mode (i.e. env HUGGINGFACE_SPACES=1 or GPT_
 * Zip: Zip logs and show file name in Zip file name box.  Can download in Zip file to Download box.
 * S3UP: If bucket, public, and private keys set up via ENV, then can push button to send logs to S3.  Show result in S3UP result text box.
 
+
+## Sidebar, Submit Buttons, and Tab Control
+
+The sidebar and submit buttons can be toggled in UI or CLI.  The tabs can be controlled by CLI options.  If one only wants to see the chat view, do:
+```bash
+python generate.py --base_model=meta-llama/Llama-2-13b-chat-hf --visible_submit_buttons=False --visible_side_bar=False --visible_submit_buttons=False --visible_side_bar=False --visible_chat_tab=False --visible_doc_selection_tab=False --visible_doc_view_tab=False --visible_chat_history_tab=False --visible_expert_tab=False --visible_models_tab=False --visible_system_tab=False --visible_tos_tab=False --visible_hosts_tab=False --chat_tabless=True
+```
+where one can still at least hit enter to submit queries. This looks like:
+![chat_tabless.png](chat_tabless.png)
+
+One can add `--visible_h2ogpt_header=False` to remove the h2oGPT header, which looks like:
+![chat_headerless.png](chat_headerless.png)

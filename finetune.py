@@ -2,7 +2,6 @@ import os
 import sys
 from functools import partial
 from typing import List, Union
-import fire
 import numpy as np
 
 if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
@@ -13,7 +12,7 @@ if os.path.dirname('src') not in sys.path:
 
 from src.loaders import get_loaders, get_tokenizer
 from src.prompter import generate_prompt, prompt_types, PromptType
-from src.utils import get_githash, copy_code
+from src.utils import get_githash, copy_code, H2O_Fire
 import torch
 
 
@@ -116,7 +115,7 @@ def train(
         replace_llama_attn_with_flash_attn()
 
     # allow set token directly
-    use_auth_token = os.environ.get("HUGGINGFACE_API_TOKEN", use_auth_token)
+    use_auth_token = os.environ.get("HUGGING_FACE_HUB_TOKEN", use_auth_token)
 
     prompt_type = str(prompt_type)  # migration from integers
     assert prompt_type in prompt_types
@@ -160,7 +159,7 @@ def train(
             raise RuntimeError("""Flash attention not installed.
             NOTE: for current pytorch 2.0, flash attention requires installing cuda 11.7 via https://developer.nvidia.com/cuda-11-7-0-download-archive?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=runfile_local and then when running, to avoid installing driver, docs, samples, just install toolkit.  Then when pip installing flash attention do:
 
-            CUDA_HOME=/usr/local/cuda-11.8 pip install flash-attn""")
+            CUDA_HOME=/usr/local/cuda-11.7 pip install flash-attn""")
     assert (
         base_model
     ), "Please specify a --base_model, e.g. --base_model='decapoda-research/llama-7b-hf'"
@@ -640,7 +639,7 @@ def generate_and_tokenize_prompt(data_point, prompt_type=None, train_on_inputs=F
 
 
 def test_debug():
-    fire.Fire(train)
+    H2O_Fire(train)
 
 
 def entrypoint_main():
@@ -673,7 +672,7 @@ NCCL_P2P_LEVEL=LOC WORLD_SIZE=7 CUDA_VISIBLE_DEVICES="0,1" torchrun --node_rank 
         assert os.environ.get(
             "CUDA_VISIBLE_DEVICES") is not None, "Run python script using: torchrun finetune.py OR set CUDA_VISIBLE_DEVICES to single GPU"
 
-    fire.Fire(train)
+    H2O_Fire(train)
 
 
 if __name__ == "__main__":

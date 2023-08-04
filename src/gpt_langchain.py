@@ -1,4 +1,7 @@
 import ast
+import asyncio
+import copy
+import functools
 import glob
 import inspect
 import os
@@ -21,7 +24,7 @@ import filelock
 from joblib import delayed
 from langchain.callbacks import streaming_stdout
 from langchain.embeddings import HuggingFaceInstructEmbeddings
-from langchain.schema import LLMResult
+from langchain.schema import LLMResult, Generation
 from tqdm import tqdm
 
 from enums import DocumentSubset, no_lora_str, model_token_mapping, source_prefix, source_postfix, non_query_commands, \
@@ -31,7 +34,8 @@ from gen import get_model, SEED
 from prompter import non_hf_types, PromptType, Prompter
 from utils import wrapped_partial, EThread, import_matplotlib, sanitize_filename, makedirs, get_url, flatten_list, \
     get_device, ProgressParallel, remove, hash_file, clear_torch_cache, NullContext, get_hf_server, FakeTokenizer, \
-    have_libreoffice, have_arxiv, have_playwright, have_selenium, have_tesseract, have_pymupdf, set_openai
+    have_libreoffice, have_arxiv, have_playwright, have_selenium, have_tesseract, have_pymupdf, set_openai, \
+    get_list_or_str, have_pillow, only_selenium, only_playwright, only_unstructured_urls, get_sha
 from utils_langchain import StreamingGradioCallbackHandler
 
 import_matplotlib()
@@ -57,14 +61,18 @@ from langchain.vectorstores import Chroma
 
 
 def get_db(sources, use_openai_embedding=False, db_type='faiss',
-           persist_directory="db_dir", load_db_if_exists=True,
+           persist_directory=None, load_db_if_exists=True,
            langchain_mode='notset',
            collection_name=None,
-           hf_embedding_model="sentence-transformers/all-MiniLM-L6-v2"):
+           hf_embedding_model=None,
+           migrate_embedding_model=False):
     if not sources:
         return None
+    if persist_directory is None:
+        persist_directory = get_persist_directory(langchain_mode)
+    assert hf_embedding_model is not None
 
-    # get embedding model
+    # get freshly-determined embedding model
     embedding = get_embedding(use_openai_embedding, hf_embedding_model=hf_embedding_model)
     assert collection_name is not None or langchain_mode != 'notset'
     if collection_name is None:
@@ -90,11 +98,13 @@ def get_db(sources, use_openai_embedding=False, db_type='faiss',
                                      index_name=index_name)
     elif db_type == 'chroma':
         assert persist_directory is not None
-        os.makedirs(persist_directory, exist_ok=True)
+        # use_base already handled when making persist_directory, unless was passed into get_db()
+        makedirs(persist_directory, exist_ok=True)
 
         # see if already actually have persistent db, and deal with possible changes in embedding
-        db = get_existing_db(None, persist_directory, load_db_if_exists, db_type, use_openai_embedding, langchain_mode,
-                             hf_embedding_model, verbose=False)
+        db, use_openai_embedding, hf_embedding_model = \
+            get_existing_db(None, persist_directory, load_db_if_exists, db_type, use_openai_embedding, langchain_mode,
+                            hf_embedding_model, migrate_embedding_model, verbose=False)
         if db is None:
             from chromadb.config import Settings
             client_settings = Settings(anonymized_telemetry=False,
@@ -110,12 +120,14 @@ def get_db(sources, use_openai_embedding=False, db_type='faiss',
             save_embed(db, use_openai_embedding, hf_embedding_model)
         else:
             # then just add
+            # doesn't check or change embedding, just saves it in case not saved yet, after persisting
             db, num_new_sources, new_sources_metadata = add_to_db(db, sources, db_type=db_type,
                                                                   use_openai_embedding=use_openai_embedding,
                                                                   hf_embedding_model=hf_embedding_model)
     else:
         raise RuntimeError("No such db_type=%s" % db_type)
 
+    # once here, db is not changing and embedding choices in calling functions does not matter
     return db
 
 
@@ -187,10 +199,25 @@ def add_to_db(db, sources, db_type='faiss',
         num_new_sources = len(sources)
         if num_new_sources == 0:
             return db, num_new_sources, []
-        db.add_documents(documents=sources)
-        db.persist()
-        clear_embedding(db)
-        save_embed(db, use_openai_embedding, hf_embedding_model)
+        if hasattr(db, '_persist_directory'):
+            print("Existing db, adding to %s" % db._persist_directory, flush=True)
+            # chroma only
+            name_path = os.path.basename(db._persist_directory)
+            base_path = 'locks'
+            base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
+            file = os.path.join(base_path, "getdb_%s.lock" % name_path)
+            context = filelock.FileLock
+        else:
+            file = None
+            context = NullContext
+        with context(file):
+            # this is place where add to db, but others maybe accessing db, so lock access.
+            # else see RuntimeError: Index seems to be corrupted or unsupported
+            db.add_documents(documents=sources)
+            db.persist()
+            clear_embedding(db)
+            # save here is for migration, in case old db directory without embedding saved
+            save_embed(db, use_openai_embedding, hf_embedding_model)
     else:
         raise RuntimeError("No such db_type=%s" % db_type)
 
@@ -200,7 +227,8 @@ def add_to_db(db, sources, db_type='faiss',
 
 
 def create_or_update_db(db_type, persist_directory, collection_name,
-                        sources, use_openai_embedding, add_if_exists, verbose, hf_embedding_model):
+                        sources, use_openai_embedding, add_if_exists, verbose,
+                        hf_embedding_model, migrate_embedding_model):
     if db_type == 'weaviate':
         import weaviate
         from weaviate.embedded import EmbeddedOptions
@@ -238,12 +266,14 @@ def create_or_update_db(db_type, persist_directory, collection_name,
                 db_type=db_type,
                 persist_directory=persist_directory,
                 langchain_mode=collection_name,
-                hf_embedding_model=hf_embedding_model)
+                hf_embedding_model=hf_embedding_model,
+                migrate_embedding_model=migrate_embedding_model)
 
     return db
 
 
-def get_embedding(use_openai_embedding, hf_embedding_model="sentence-transformers/all-MiniLM-L6-v2"):
+def get_embedding(use_openai_embedding, hf_embedding_model=None):
+    assert hf_embedding_model is not None
     # Get embedding model
     if use_openai_embedding:
         assert os.getenv("OPENAI_API_KEY") is not None, "Set ENV OPENAI_API_KEY"
@@ -277,11 +307,11 @@ def get_answer_from_sources(chain, sources, question):
 
 """Wrapper around Huggingface text generation inference API."""
 from functools import partial
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Iterable
 
 from pydantic import Extra, Field, root_validator
 
-from langchain.callbacks.manager import CallbackManagerForLLMRun, Callbacks
+from langchain.callbacks.manager import CallbackManagerForLLMRun, AsyncCallbackManagerForLLMRun
 from langchain.llms.base import LLM
 
 
@@ -305,7 +335,7 @@ class GradioInference(LLM):
     chat_client: bool = False
 
     return_full_text: bool = True
-    stream: bool = False
+    stream_output: bool = False
     sanitize_bot_response: bool = False
 
     prompter: Any = None
@@ -351,7 +381,7 @@ class GradioInference(LLM):
         # so server should get prompt_type or '', not plain
         # This is good, so gradio server can also handle stopping.py conditions
         # this is different than TGI server that uses prompter to inject prompt_type prompting
-        stream_output = self.stream
+        stream_output = self.stream_output
         gr_client = self.client
         client_langchain_mode = 'Disabled'
         client_add_chat_history_to_context = True
@@ -459,33 +489,15 @@ class H2OHuggingFaceTextGenInference(HuggingFaceTextGenInference):
     inference_server_url: str = ""
     timeout: int = 300
     headers: dict = None
-    stream: bool = False
+    stream_output: bool = False
     sanitize_bot_response: bool = False
     prompter: Any = None
     context: Any = ''
     iinput: Any = ''
     tokenizer: Any = None
-    client: Any = None
-
-    @root_validator()
-    def validate_environment(cls, values: Dict) -> Dict:
-        """Validate that python package exists in environment."""
-
-        try:
-            if values['client'] is None:
-                import text_generation
-
-                values["client"] = text_generation.Client(
-                    values["inference_server_url"],
-                    timeout=values["timeout"],
-                    headers=values["headers"],
-                )
-        except ImportError:
-            raise ImportError(
-                "Could not import text_generation python package. "
-                "Please install it with `pip install text_generation`."
-            )
-        return values
+    async_sem: Any = None
+    count_input_tokens: Any = 0
+    count_output_tokens: Any = 0
 
     def _call(
             self,
@@ -495,9 +507,12 @@ class H2OHuggingFaceTextGenInference(HuggingFaceTextGenInference):
             **kwargs: Any,
     ) -> str:
         if stop is None:
-            stop = self.stop_sequences
+            stop = self.stop_sequences.copy()
         else:
-            stop += self.stop_sequences
+            stop += self.stop_sequences.copy()
+        stop_tmp = stop.copy()
+        stop = []
+        [stop.append(x) for x in stop_tmp if x not in stop]
 
         # HF inference server needs control over input tokens
         assert self.tokenizer is not None
@@ -507,6 +522,7 @@ class H2OHuggingFaceTextGenInference(HuggingFaceTextGenInference):
         # NOTE: TGI server does not add prompting, so must do here
         data_point = dict(context=self.context, instruction=prompt, input=self.iinput)
         prompt = self.prompter.generate_prompt(data_point)
+        self.count_input_tokens += self.get_num_tokens(prompt)
 
         gen_server_kwargs = dict(do_sample=self.do_sample,
                                  stop_sequences=stop,
@@ -524,7 +540,7 @@ class H2OHuggingFaceTextGenInference(HuggingFaceTextGenInference):
         # lower bound because client is re-used if multi-threading
         self.client.timeout = max(300, self.timeout)
 
-        if not self.stream:
+        if not self.stream_output:
             res = self.client.generate(
                 prompt,
                 **gen_server_kwargs,
@@ -559,19 +575,96 @@ class H2OHuggingFaceTextGenInference(HuggingFaceTextGenInference):
                 # stream part
                 is_stop = False
                 for stop_seq in stop:
-                    if stop_seq in response.token.text:
+                    if stop_seq in text_chunk:
                         is_stop = True
                         break
                 if is_stop:
                     break
                 if not response.token.special:
                     if text_callback:
-                        text_callback(response.token.text)
+                        text_callback(text_chunk)
+        self.count_output_tokens += self.get_num_tokens(text)
         return text
+
+    async def _acall(
+            self,
+            prompt: str,
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+            **kwargs: Any,
+    ) -> str:
+        # print("acall", flush=True)
+        if stop is None:
+            stop = self.stop_sequences.copy()
+        else:
+            stop += self.stop_sequences.copy()
+        stop_tmp = stop.copy()
+        stop = []
+        [stop.append(x) for x in stop_tmp if x not in stop]
+
+        # HF inference server needs control over input tokens
+        assert self.tokenizer is not None
+        from h2oai_pipeline import H2OTextGenerationPipeline
+        prompt, num_prompt_tokens = H2OTextGenerationPipeline.limit_prompt(prompt, self.tokenizer)
+
+        # NOTE: TGI server does not add prompting, so must do here
+        data_point = dict(context=self.context, instruction=prompt, input=self.iinput)
+        prompt = self.prompter.generate_prompt(data_point)
+
+        gen_text = await super()._acall(prompt, stop=stop, run_manager=run_manager, **kwargs)
+
+        # remove stop sequences from the end of the generated text
+        for stop_seq in stop:
+            if stop_seq in gen_text:
+                gen_text = gen_text[:gen_text.index(stop_seq)]
+        text = prompt + gen_text
+        text = self.prompter.get_response(text, prompt=prompt,
+                                          sanitize_bot_response=self.sanitize_bot_response)
+        # print("acall done", flush=True)
+        return text
+
+    async def _agenerate(
+            self,
+            prompts: List[str],
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+            **kwargs: Any,
+    ) -> LLMResult:
+        """Run the LLM on the given prompt and input."""
+        generations = []
+        new_arg_supported = inspect.signature(self._acall).parameters.get("run_manager")
+        self.count_input_tokens += sum([self.get_num_tokens(prompt) for prompt in prompts])
+        tasks = [
+            asyncio.ensure_future(self._agenerate_one(prompt, stop=stop, run_manager=run_manager,
+                                                      new_arg_supported=new_arg_supported, **kwargs))
+            for prompt in prompts
+        ]
+        texts = await asyncio.gather(*tasks)
+        self.count_output_tokens += sum([self.get_num_tokens(text) for text in texts])
+        [generations.append([Generation(text=text)]) for text in texts]
+        return LLMResult(generations=generations)
+
+    async def _agenerate_one(
+            self,
+            prompt: str,
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+            new_arg_supported=None,
+            **kwargs: Any,
+    ) -> str:
+        async with self.async_sem:  # semaphore limits num of simultaneous downloads
+            return await self._acall(prompt, stop=stop, run_manager=run_manager, **kwargs) \
+                if new_arg_supported else \
+                await self._acall(prompt, stop=stop, **kwargs)
+
+    def get_token_ids(self, text: str) -> List[int]:
+        return self.tokenizer.encode(text)
+        # avoid base method that is not aware of how to properly tokenize (uses GPT2)
+        # return _get_token_ids_default_method(text)
 
 
 from langchain.chat_models import ChatOpenAI
-from langchain.llms import OpenAI
+from langchain.llms import OpenAI, Replicate
 from langchain.llms.openai import _streaming_response_template, completion_with_retry, _update_response, \
     update_token_usage
 
@@ -589,12 +682,12 @@ class H2OOpenAI(OpenAI):
     tokenizer: Any = None
 
     @classmethod
-    def all_required_field_names(cls) -> Set:
-        all_required_field_names = super(OpenAI, cls).all_required_field_names()
-        all_required_field_names.update(
+    def _all_required_field_names(cls) -> Set:
+        _all_required_field_names = super(OpenAI, cls)._all_required_field_names()
+        _all_required_field_names.update(
             {'top_p', 'frequency_penalty', 'presence_penalty', 'stop_sequences', 'sanitize_bot_response', 'prompter',
-             'tokenizer'})
-        return all_required_field_names
+             'tokenizer', 'logit_bias'})
+        return _all_required_field_names
 
     def _generate(
             self,
@@ -603,7 +696,9 @@ class H2OOpenAI(OpenAI):
             run_manager: Optional[CallbackManagerForLLMRun] = None,
             **kwargs: Any,
     ) -> LLMResult:
-        stop = self.stop_sequences if not stop else self.stop_sequences + stop
+        stop_tmp = self.stop_sequences if not stop else self.stop_sequences + stop
+        stop = []
+        [stop.append(x) for x in stop_tmp if x not in stop]
 
         # HF inference server needs control over input tokens
         assert self.tokenizer is not None
@@ -661,12 +756,44 @@ class H2OOpenAI(OpenAI):
         return self.create_llm_result(choices, prompts, token_usage)
 
 
+class H2OReplicate(Replicate):
+    stop_sequences: Any = None
+    sanitize_bot_response: bool = False
+    prompter: Any = None
+    context: Any = ''
+    iinput: Any = ''
+    tokenizer: Any = None
+
+    def _call(
+            self,
+            prompt: str,
+            stop: Optional[List[str]] = None,
+            run_manager: Optional[CallbackManagerForLLMRun] = None,
+            **kwargs: Any,
+    ) -> str:
+        """Call to replicate endpoint."""
+        stop_tmp = self.stop_sequences if not stop else self.stop_sequences + stop
+        stop = []
+        [stop.append(x) for x in stop_tmp if x not in stop]
+
+        # HF inference server needs control over input tokens
+        assert self.tokenizer is not None
+        from h2oai_pipeline import H2OTextGenerationPipeline
+        prompt, num_prompt_tokens = H2OTextGenerationPipeline.limit_prompt(prompt, self.tokenizer)
+        # Note Replicate handles the prompting of the specific model
+        if False:
+            data_point = dict(context=self.context, instruction=prompt, input=self.iinput)
+            prompt = self.prompter.generate_prompt(data_point)
+
+        return super()._call(prompt, stop=stop, run_manager=run_manager, **kwargs)
+
+
 class H2OChatOpenAI(ChatOpenAI):
     @classmethod
-    def all_required_field_names(cls) -> Set:
-        all_required_field_names = super(ChatOpenAI, cls).all_required_field_names()
-        all_required_field_names.update({'top_p', 'frequency_penalty', 'presence_penalty'})
-        return all_required_field_names
+    def _all_required_field_names(cls) -> Set:
+        _all_required_field_names = super(ChatOpenAI, cls)._all_required_field_names()
+        _all_required_field_names.update({'top_p', 'frequency_penalty', 'presence_penalty', 'logit_bias'})
+        return _all_required_field_names
 
 
 def get_llm(use_openai_model=False,
@@ -674,13 +801,16 @@ def get_llm(use_openai_model=False,
             model=None,
             tokenizer=None,
             inference_server=None,
+            langchain_only_model=None,
             stream_output=False,
+            async_output=True,
+            num_async=3,
             do_sample=False,
             temperature=0.1,
             top_k=40,
             top_p=0.7,
             num_beams=1,
-            max_new_tokens=256,
+            max_new_tokens=512,
             min_new_tokens=1,
             early_stopping=False,
             max_time=180,
@@ -692,11 +822,58 @@ def get_llm(use_openai_model=False,
             context=None,
             iinput=None,
             sanitize_bot_response=False,
+            system_prompt='',
+            n_jobs=None,
+            cli=False,
             verbose=False,
             ):
+    if n_jobs is None:
+        n_jobs = int(os.getenv('OMP_NUM_THREADS', str(os.cpu_count() // 2)))
     if inference_server is None:
         inference_server = ''
-    if use_openai_model or inference_server.startswith('openai') or inference_server.startswith('vllm'):
+    if inference_server.startswith('replicate'):
+        model_string = ':'.join(inference_server.split(':')[1:])
+        gen_kwargs = dict(temperature=temperature if do_sample else 0,
+                          max_length=max_new_tokens,  # langchain
+                          max_new_tokens=max_new_tokens,  # replicate docs
+                          top_p=top_p if do_sample else 1,
+                          top_k=top_k,  # not always supported
+                          repetition_penalty=repetition_penalty)
+        if system_prompt:
+            gen_kwargs.update(dict(system_prompt=system_prompt))
+        elif prompter.system_prompt:
+            gen_kwargs.update(dict(system_prompt=prompter.system_prompt))
+        if stream_output:
+            callbacks = [StreamingGradioCallbackHandler()]
+            streamer = callbacks[0] if stream_output else None
+            llm = H2OReplicate(
+                streaming=True,
+                callbacks=callbacks,
+                model=model_string,
+                input=gen_kwargs,
+                stop=prompter.stop_sequences,
+                stop_sequences=prompter.stop_sequences,
+                sanitize_bot_response=sanitize_bot_response,
+                prompter=prompter,
+                context=context,
+                iinput=iinput,
+                tokenizer=tokenizer,
+            )
+        else:
+            streamer = None
+            llm = H2OReplicate(
+                model=model_string,
+                input=gen_kwargs,
+                stop=prompter.stop_sequences,
+                stop_sequences=prompter.stop_sequences,
+                sanitize_bot_response=sanitize_bot_response,
+                prompter=prompter,
+                context=context,
+                iinput=iinput,
+                tokenizer=tokenizer,
+            )
+
+    elif use_openai_model or inference_server.startswith('openai') or inference_server.startswith('vllm'):
         if use_openai_model and model_name is None:
             model_name = "gpt-3.5-turbo"
         # FIXME: Will later import be ignored?  I think so, so should be fine
@@ -708,10 +885,7 @@ def get_llm(use_openai_model=False,
         else:
             cls = H2OOpenAI
             if inf_type == 'vllm':
-                terminate_response = prompter.terminate_response or []
-                stop_sequences = list(set(terminate_response + [prompter.PreResponse]))
-                stop_sequences = [x for x in stop_sequences if x]
-                kwargs_extra = dict(stop_sequences=stop_sequences,
+                kwargs_extra = dict(stop_sequences=prompter.stop_sequences,
                                     sanitize_bot_response=sanitize_bot_response,
                                     prompter=prompter,
                                     context=context,
@@ -759,14 +933,10 @@ def get_llm(use_openai_model=False,
 
         # quick sanity check to avoid long timeouts, just see if can reach server
         requests.get(inference_server, timeout=int(os.getenv('REQUEST_TIMEOUT_FAST', '10')))
-
         callbacks = [StreamingGradioCallbackHandler()]
-        assert prompter is not None
-        terminate_response = prompter.terminate_response or []
-        stop_sequences = list(set(terminate_response + [prompter.PreResponse]))
-        stop_sequences = [x for x in stop_sequences if x]
 
         if gr_client:
+            async_output = False  # FIXME: not implemented yet
             chat_client = False
             llm = GradioInference(
                 inference_server_url=inference_server,
@@ -786,7 +956,7 @@ def get_llm(use_openai_model=False,
                 chat_client=chat_client,
 
                 callbacks=callbacks if stream_output else None,
-                stream=stream_output,
+                stream_output=stream_output,
                 prompter=prompter,
                 context=context,
                 iinput=iinput,
@@ -794,33 +964,37 @@ def get_llm(use_openai_model=False,
                 sanitize_bot_response=sanitize_bot_response,
             )
         elif hf_client:
+            # no need to pass original client, no state and fast, so can use same validate_environment from base class
+            async_sem = asyncio.Semaphore(num_async) if async_output else NullContext()
             llm = H2OHuggingFaceTextGenInference(
                 inference_server_url=inference_server,
                 do_sample=do_sample,
                 max_new_tokens=max_new_tokens,
                 repetition_penalty=repetition_penalty,
-                return_full_text=True,
+                return_full_text=False,
                 seed=SEED,
 
-                stop_sequences=stop_sequences,
+                stop_sequences=prompter.stop_sequences,
                 temperature=temperature,
                 top_k=top_k,
                 top_p=top_p,
                 # typical_p=top_p,
                 callbacks=callbacks if stream_output else None,
-                stream=stream_output,
+                stream_output=stream_output,
                 prompter=prompter,
                 context=context,
                 iinput=iinput,
                 tokenizer=tokenizer,
-                client=hf_client,
                 timeout=max_time,
                 sanitize_bot_response=sanitize_bot_response,
+                async_sem=async_sem,
             )
         else:
             raise RuntimeError("No defined client")
         streamer = callbacks[0] if stream_output else None
     elif model_name in non_hf_types:
+        async_output = False  # FIXME: not implemented yet
+        assert langchain_only_model
         if model_name == 'llama':
             callbacks = [StreamingGradioCallbackHandler()]
             streamer = callbacks[0] if stream_output else None
@@ -841,13 +1015,45 @@ def get_llm(use_openai_model=False,
                               top_k=top_k,
                               top_p=top_p,
                               callbacks=callbacks,
+                              n_jobs=n_jobs,
                               verbose=verbose,
                               streaming=stream_output,
                               prompter=prompter,
                               context=context,
                               iinput=iinput,
                               )
+    elif hasattr(model, 'is_exlama') and model.is_exlama():
+        async_output = False  # FIXME: not implemented yet
+        assert langchain_only_model
+        callbacks = [StreamingGradioCallbackHandler()]
+        streamer = callbacks[0] if stream_output else None
+        max_max_tokens = tokenizer.model_max_length
+
+        from src.llm_exllama import Exllama
+        llm = Exllama(streaming=stream_output,
+                      model_path=None,
+                      model=model,
+                      lora_path=None,
+                      temperature=temperature,
+                      top_k=top_k,
+                      top_p=top_p,
+                      typical=.7,
+                      beams=1,
+                      # beam_length = 40,
+                      stop_sequences=prompter.stop_sequences,
+                      callbacks=callbacks,
+                      verbose=verbose,
+                      max_seq_len=max_max_tokens,
+                      fused_attn=False,
+                      # alpha_value = 1.0, #For use with any models
+                      # compress_pos_emb = 4.0, #For use with superhot
+                      # set_auto_map = "3, 2" #Gpu split, this will split 3gigs/2gigs
+                      prompter=prompter,
+                      context=context,
+                      iinput=iinput,
+                      )
     else:
+        async_output = False  # FIXME: not implemented yet
         if model is None:
             # only used if didn't pass model in
             assert tokenizer is None
@@ -905,7 +1111,7 @@ def get_llm(use_openai_model=False,
 
         from langchain.llms import HuggingFacePipeline
         llm = HuggingFacePipeline(pipeline=pipe)
-    return llm, model_name, streamer, prompt_type
+    return llm, model_name, streamer, prompt_type, async_output
 
 
 def get_device_dtype():
@@ -993,7 +1199,7 @@ def get_github_docs(repo_owner, repo_name):
 def get_dai_pickle(dest="."):
     from huggingface_hub import hf_hub_download
     # True for case when locally already logged in with correct token, so don't have to set key
-    token = os.getenv('HUGGINGFACE_API_TOKEN', True)
+    token = os.getenv('HUGGING_FACE_HUB_TOKEN', True)
     path_to_zip_file = hf_hub_download('h2oai/dai_docs', 'dai_docs.pickle', token=token, repo_type='dataset')
     shutil.copy(path_to_zip_file, dest)
 
@@ -1043,15 +1249,37 @@ def get_dai_docs(from_hf=False, get_pickle=True):
     return sources
 
 
-image_types = ["png", "jpg", "jpeg"]
-non_image_types = ["pdf", "txt", "csv", "toml", "py", "rst", "rtf",
-                   "md",
-                   "html", "mhtml",
-                   "enex", "eml", "epub", "odt", "pptx", "ppt",
-                   "zip", "urls",
+def get_supported_types():
+    non_image_types0 = ["pdf", "txt", "csv", "toml", "py", "rst", "rtf",
+                        "md",
+                        "html", "mhtml", "htm",
+                        "enex", "eml", "epub", "odt", "pptx", "ppt",
+                        "zip", "urls",
+                        ]
+    # "msg",  GPL3
 
-                   ]
-# "msg",  GPL3
+    video_types0 = ['WEBM',
+                    'MPG', 'MP2', 'MPEG', 'MPE', '.PV',
+                    'OGG',
+                    'MP4', 'M4P', 'M4V',
+                    'AVI', 'WMV',
+                    'MOV', 'QT',
+                    'FLV', 'SWF',
+                    'AVCHD']
+    video_types0 = [x.lower() for x in video_types0]
+    if have_pillow:
+        from PIL import Image
+        exts = Image.registered_extensions()
+        image_types0 = {ex for ex, f in exts.items() if f in Image.OPEN if ex not in video_types0 + non_image_types0}
+        image_types0 = sorted(image_types0)
+        image_types0 = [x[1:] if x.startswith('.') else x for x in image_types0]
+    else:
+        image_types0 = []
+    return non_image_types0, image_types0, video_types0
+
+
+non_image_types, image_types, video_types = get_supported_types()
+set_image_types = set(image_types)
 
 if have_libreoffice or True:
     # or True so it tries to load, e.g. on MAC/Windows, even if don't have libreoffice since works without that
@@ -1060,14 +1288,21 @@ if have_libreoffice or True:
 file_types = non_image_types + image_types
 
 
-def add_meta(docs1, file):
-    file_extension = pathlib.Path(file).suffix
-    hashid = hash_file(file)
+def add_meta(docs1, file, headsize):
+    if os.path.isfile(file):
+        file_extension = pathlib.Path(file).suffix
+        hashid = hash_file(file)
+    else:
+        file_extension = str(file)  # not file, just show full thing
+        hashid = get_sha(file)
     doc_hash = str(uuid.uuid4())[:10]
     if not isinstance(docs1, (list, tuple, types.GeneratorType)):
         docs1 = [docs1]
-    [x.metadata.update(dict(input_type=file_extension, date=str(datetime.now()), hashid=hashid, doc_hash=doc_hash)) for
-     x in docs1]
+    [x.metadata.update(dict(input_type=file_extension,
+                            date=str(datetime.now()),
+                            hashid=hashid,
+                            doc_hash=doc_hash,
+                            head=x.page_content[:headsize].strip())) for x in docs1]
 
 
 def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
@@ -1076,7 +1311,16 @@ def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
                 enable_captions=True,
                 captions_model=None,
                 enable_ocr=False, enable_pdf_ocr='auto', caption_loader=None,
-                headsize=50):
+                headsize=50,
+                db_type=None,
+                selected_file_types=None):
+    if selected_file_types is not None:
+        set_image_types1 = set_image_types.intersection(set(selected_file_types))
+    else:
+        set_image_types1 = set_image_types
+
+    assert db_type is not None
+    chunk_sources = functools.partial(_chunk_sources, chunk=chunk, chunk_size=chunk_size, db_type=db_type)
     if file is None:
         if fail_any_exception:
             raise RuntimeError("Unexpected None file")
@@ -1093,10 +1337,23 @@ def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
         base_path = os.path.join(dir_name, base_name)
     if is_url:
         file = file.strip()  # in case accidental spaces in front or at end
-        if file.lower().startswith('arxiv:'):
-            query = file.lower().split('arxiv:')
-            if len(query) == 2 and have_arxiv:
-                query = query[1]
+        file_lower = file.lower()
+        case1 = file_lower.startswith('arxiv:') and len(file_lower.split('arxiv:')) == 2
+        case2 = file_lower.startswith('https://arxiv.org/abs') and len(file_lower.split('https://arxiv.org/abs')) == 2
+        case3 = file_lower.startswith('http://arxiv.org/abs') and len(file_lower.split('http://arxiv.org/abs')) == 2
+        case4 = file_lower.startswith('arxiv.org/abs/') and len(file_lower.split('arxiv.org/abs/')) == 2
+        if case1 or case2 or case3 or case4:
+            if case1:
+                query = file.lower().split('arxiv:')[1].strip()
+            elif case2:
+                query = file.lower().split('https://arxiv.org/abs/')[1].strip()
+            elif case2:
+                query = file.lower().split('http://arxiv.org/abs/')[1].strip()
+            elif case3:
+                query = file.lower().split('arxiv.org/abs/')[1].strip()
+            else:
+                raise RuntimeError("Unexpected arxiv error for %s" % file)
+            if have_arxiv:
                 docs1 = ArxivLoader(query=query, load_max_docs=20, load_all_available_meta=True).load()
                 # ensure string, sometimes None
                 [[x.metadata.update({k: str(v)}) for k, v in x.metadata.items()] for x in docs1]
@@ -1110,92 +1367,103 @@ def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
         else:
             if not (file.startswith("http://") or file.startswith("file://") or file.startswith("https://")):
                 file = 'http://' + file
-            docs1 = UnstructuredURLLoader(urls=[file]).load()
-            if len(docs1) == 0 and have_playwright:
+            docs1 = []
+            do_unstructured = only_unstructured_urls or not (only_selenium or only_playwright)
+            do_playwright = have_playwright and (only_playwright or not (only_selenium or only_unstructured_urls))
+            do_selenium = have_selenium and (only_selenium or not (only_playwright or only_unstructured_urls))
+
+            if do_unstructured:
+                docs1 = UnstructuredURLLoader(urls=[file]).load()
+                docs1 = [x for x in docs1 if x.page_content]
+            if len(docs1) == 0 and do_playwright:
                 # then something went wrong, try another loader:
                 from langchain.document_loaders import PlaywrightURLLoader
                 docs1 = PlaywrightURLLoader(urls=[file]).load()
-            if len(docs1) == 0 and have_selenium:
+                docs1 = [x for x in docs1 if x.page_content]
+            if len(docs1) == 0 and do_selenium:
                 # then something went wrong, try another loader:
-                # but requires Chrome binary, else get: selenium.common.exceptions.WebDriverException: Message: unknown error: cannot find Chrome binary
+                # but requires Chrome binary, else get: selenium.common.exceptions.WebDriverException:
+                # Message: unknown error: cannot find Chrome binary
                 from langchain.document_loaders import SeleniumURLLoader
                 from selenium.common.exceptions import WebDriverException
                 try:
                     docs1 = SeleniumURLLoader(urls=[file]).load()
+                    docs1 = [x for x in docs1 if x.page_content]
                 except WebDriverException as e:
                     print("No web driver: %s" % str(e), flush=True)
             [x.metadata.update(dict(input_type='url', date=str(datetime.now))) for x in docs1]
+        add_meta(docs1, file, headsize)
         docs1 = clean_doc(docs1)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+        doc1 = chunk_sources(docs1)
     elif is_txt:
         base_path = "user_paste"
+        base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
         source_file = os.path.join(base_path, "_%s" % str(uuid.uuid4())[:10])
-        makedirs(os.path.dirname(source_file), exist_ok=True)
         with open(source_file, "wt") as f:
             f.write(file)
         metadata = dict(source=source_file, date=str(datetime.now()), input_type='pasted txt')
         doc1 = Document(page_content=file, metadata=metadata)
+        add_meta(doc1, file, headsize)
         doc1 = clean_doc(doc1)
-    elif file.lower().endswith('.html') or file.lower().endswith('.mhtml'):
+    elif file.lower().endswith('.html') or file.lower().endswith('.mhtml') or file.lower().endswith('.htm'):
         docs1 = UnstructuredHTMLLoader(file_path=file).load()
-        add_meta(docs1, file)
+        add_meta(docs1, file, headsize)
         docs1 = clean_doc(docs1)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size, language=Language.HTML)
+        doc1 = chunk_sources(docs1, language=Language.HTML)
     elif (file.lower().endswith('.docx') or file.lower().endswith('.doc')) and (have_libreoffice or True):
         docs1 = UnstructuredWordDocumentLoader(file_path=file).load()
-        add_meta(docs1, file)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+        add_meta(docs1, file, headsize)
+        doc1 = chunk_sources(docs1)
     elif (file.lower().endswith('.xlsx') or file.lower().endswith('.xls')) and (have_libreoffice or True):
         docs1 = UnstructuredExcelLoader(file_path=file).load()
-        add_meta(docs1, file)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+        add_meta(docs1, file, headsize)
+        doc1 = chunk_sources(docs1)
     elif file.lower().endswith('.odt'):
         docs1 = UnstructuredODTLoader(file_path=file).load()
-        add_meta(docs1, file)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+        add_meta(docs1, file, headsize)
+        doc1 = chunk_sources(docs1)
     elif file.lower().endswith('pptx') or file.lower().endswith('ppt'):
         docs1 = UnstructuredPowerPointLoader(file_path=file).load()
-        add_meta(docs1, file)
+        add_meta(docs1, file, headsize)
         docs1 = clean_doc(docs1)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+        doc1 = chunk_sources(docs1)
     elif file.lower().endswith('.txt'):
         # use UnstructuredFileLoader ?
         docs1 = TextLoader(file, encoding="utf8", autodetect_encoding=True).load()
         # makes just one, but big one
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+        doc1 = chunk_sources(docs1)
         doc1 = clean_doc(doc1)
-        add_meta(doc1, file)
+        add_meta(doc1, file, headsize)
     elif file.lower().endswith('.rtf'):
         docs1 = UnstructuredRTFLoader(file).load()
-        add_meta(docs1, file)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+        add_meta(docs1, file, headsize)
+        doc1 = chunk_sources(docs1)
     elif file.lower().endswith('.md'):
         docs1 = UnstructuredMarkdownLoader(file).load()
-        add_meta(docs1, file)
+        add_meta(docs1, file, headsize)
         docs1 = clean_doc(docs1)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size, language=Language.MARKDOWN)
+        doc1 = chunk_sources(docs1, language=Language.MARKDOWN)
     elif file.lower().endswith('.enex'):
         docs1 = EverNoteLoader(file).load()
-        add_meta(doc1, file)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+        add_meta(doc1, file, headsize)
+        doc1 = chunk_sources(docs1)
     elif file.lower().endswith('.epub'):
         docs1 = UnstructuredEPubLoader(file).load()
-        add_meta(docs1, file)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
-    elif file.lower().endswith('.jpeg') or file.lower().endswith('.jpg') or file.lower().endswith('.png'):
+        add_meta(docs1, file, headsize)
+        doc1 = chunk_sources(docs1)
+    elif any(file.lower().endswith(x) for x in set_image_types1):
         docs1 = []
         if have_tesseract and enable_ocr:
             # OCR, somewhat works, but not great
             docs1.extend(UnstructuredImageLoader(file).load())
-            add_meta(docs1, file)
+            add_meta(docs1, file, headsize)
         if enable_captions:
             # BLIP
             if caption_loader is not None and not isinstance(caption_loader, (str, bool)):
                 # assumes didn't fork into this process with joblib, else can deadlock
                 caption_loader.set_image_paths([file])
                 docs1c = caption_loader.load()
-                add_meta(docs1c, file)
-                [x.metadata.update(dict(head=x.page_content[:headsize].strip())) for x in docs1c]
+                add_meta(docs1c, file, headsize)
                 docs1.extend(docs1c)
             else:
                 from image_captions import H2OImageCaptionLoader
@@ -1204,14 +1472,14 @@ def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
                                                        blip_processor=captions_model)
                 caption_loader.set_image_paths([file])
                 docs1c = caption_loader.load()
-                add_meta(docs1c, file)
-                [x.metadata.update(dict(head=x.page_content[:headsize].strip())) for x in docs1c]
+                add_meta(docs1c, file, headsize)
                 docs1.extend(docs1c)
+            # caption didn't set source, so fix-up meta
             for doci in docs1:
                 doci.metadata['source'] = doci.metadata['image_path']
-                doci.metadata['hash'] = hash_file(doci.metadata['source'])
+                doci.metadata['hashid'] = hash_file(doci.metadata['source'])
             if docs1:
-                doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+                doc1 = chunk_sources(docs1)
     elif file.lower().endswith('.msg'):
         raise RuntimeError("Not supported, GPL3 license")
         # docs1 = OutlookMessageLoader(file).load()
@@ -1219,17 +1487,21 @@ def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
     elif file.lower().endswith('.eml'):
         try:
             docs1 = UnstructuredEmailLoader(file).load()
-            add_meta(docs1, file)
-            doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+            add_meta(docs1, file, headsize)
+            doc1 = chunk_sources(docs1)
         except ValueError as e:
             if 'text/html content not found in email' in str(e):
-                # e.g. plain/text dict key exists, but not
-                # doc1 = TextLoader(file, encoding="utf8").load()
-                docs1 = UnstructuredEmailLoader(file, content_source="text/plain").load()
-                add_meta(docs1, file)
-                doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+                pass
             else:
                 raise
+        doc1 = [x for x in doc1 if x.page_content]
+        if len(doc1) == 0:
+            # e.g. plain/text dict key exists, but not
+            # doc1 = TextLoader(file, encoding="utf8").load()
+            docs1 = UnstructuredEmailLoader(file, content_source="text/plain").load()
+            docs1 = [x for x in docs1 if x.page_content]
+            add_meta(docs1, file, headsize)
+            doc1 = chunk_sources(docs1)
     # elif file.lower().endswith('.gcsdir'):
     #    doc1 = GCSDirectoryLoader(project_name, bucket, prefix).load()
     # elif file.lower().endswith('.gcsfile'):
@@ -1237,8 +1509,8 @@ def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
     elif file.lower().endswith('.rst'):
         with open(file, "r") as f:
             doc1 = Document(page_content=f.read(), metadata={"source": file})
-        add_meta(doc1, file)
-        doc1 = chunk_sources(doc1, chunk=chunk, chunk_size=chunk_size, language=Language.RST)
+        add_meta(doc1, file, headsize)
+        doc1 = chunk_sources(doc1, language=Language.RST)
     elif file.lower().endswith('.pdf'):
         env_gpt4all_file = ".env_gpt4all"
         from dotenv import dotenv_values
@@ -1246,17 +1518,26 @@ def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
         pdf_class_name = env_kwargs.get('PDF_CLASS_NAME', 'PyMuPDFParser')
         doc1 = []
         handled = False
+        e = None
         if have_pymupdf and pdf_class_name == 'PyMuPDFParser':
             # GPL, only use if installed
             from langchain.document_loaders import PyMuPDFLoader
             # load() still chunks by pages, but every page has title at start to help
-            doc1 = PyMuPDFLoader(file).load()
+            try:
+                doc1 = PyMuPDFLoader(file).load()
+            except BaseException as e0:
+                print("PyMuPDFLoader: %s" % str(e0), flush=True)
+                e = e0
             # remove empty documents
             handled |= len(doc1) > 0
             doc1 = [x for x in doc1 if x.page_content]
             doc1 = clean_doc(doc1)
         if len(doc1) == 0:
-            doc1 = UnstructuredPDFLoader(file).load()
+            try:
+                doc1 = UnstructuredPDFLoader(file).load()
+            except BaseException as e0:
+                print("UnstructuredPDFLoader: %s" % str(e0), flush=True)
+                e = e0
             handled |= len(doc1) > 0
             # remove empty documents
             doc1 = [x for x in doc1 if x.page_content]
@@ -1264,7 +1545,11 @@ def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
         if len(doc1) == 0:
             # open-source fallback
             # load() still chunks by pages, but every page has title at start to help
-            doc1 = PyPDFLoader(file).load()
+            try:
+                doc1 = PyPDFLoader(file).load()
+            except BaseException as e0:
+                print("PyPDFLoader: %s" % str(e0), flush=True)
+                e = e0
             handled |= len(doc1) > 0
             # remove empty documents
             doc1 = [x for x in doc1 if x.page_content]
@@ -1273,11 +1558,28 @@ def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
             # GPL, only use if installed
             from langchain.document_loaders import PyMuPDFLoader
             # load() still chunks by pages, but every page has title at start to help
-            doc1 = PyMuPDFLoader(file).load()
+            try:
+                doc1 = PyMuPDFLoader(file).load()
+            except BaseException as e0:
+                print("PyMuPDFLoader: %s" % str(e0), flush=True)
+                e = e0
             handled |= len(doc1) > 0
             # remove empty documents
             doc1 = [x for x in doc1 if x.page_content]
             doc1 = clean_doc(doc1)
+
+        # try treating as html as occurs when scraping websites
+        if len(doc1) == 0:
+            from bs4 import BeautifulSoup
+            with open(file, "rt") as f:
+                try:
+                    is_html = bool(BeautifulSoup(f.read(), "html.parser").find())
+                except:  # FIXME
+                    is_html = False
+            if is_html:
+                file_url = 'file://' + file
+                doc1 = UnstructuredURLLoader(urls=[file_url]).load()
+                doc1 = [x for x in doc1 if x.page_content]
         if len(doc1) == 0 and enable_pdf_ocr == 'auto' or enable_pdf_ocr == 'on':
             # try OCR in end since slowest, but works on pure image pages well
             doc1 = UnstructuredPDFLoader(file, strategy='ocr_only').load()
@@ -1291,46 +1593,52 @@ def file_to_doc(file, base_path=None, verbose=False, fail_any_exception=False,
             if handled:
                 raise ValueError("%s had no valid text, but meta data was parsed" % file)
             else:
-                raise ValueError("%s had no valid text and no meta data was parsed" % file)
-        doc1 = chunk_sources(doc1, chunk=chunk, chunk_size=chunk_size)
-        add_meta(doc1, file)
+                raise ValueError("%s had no valid text and no meta data was parsed: %s" % (file, str(e)))
+        add_meta(doc1, file, headsize)
+        doc1 = chunk_sources(doc1)
     elif file.lower().endswith('.csv'):
         doc1 = CSVLoader(file).load()
-        add_meta(doc1, file)
+        add_meta(doc1, file, headsize)
+        if isinstance(doc1, list):
+            # each row is a Document, identify
+            [x.metadata.update(dict(chunk_id=chunk_id)) for chunk_id, x in enumerate(doc1)]
+            if db_type == 'chroma':
+                # then separate summarize list
+                sdoc1 = clone_documents(doc1)
+                [x.metadata.update(dict(chunk_id=-1)) for chunk_id, x in enumerate(sdoc1)]
+                doc1 = sdoc1 + doc1
     elif file.lower().endswith('.py'):
         doc1 = PythonLoader(file).load()
-        add_meta(doc1, file)
-        doc1 = chunk_sources(doc1, chunk=chunk, chunk_size=chunk_size, language=Language.PYTHON)
+        add_meta(doc1, file, headsize)
+        doc1 = chunk_sources(doc1, language=Language.PYTHON)
     elif file.lower().endswith('.toml'):
         doc1 = TomlLoader(file).load()
-        add_meta(doc1, file)
+        add_meta(doc1, file, headsize)
+        doc1 = chunk_sources(doc1)
     elif file.lower().endswith('.urls'):
         with open(file, "r") as f:
-            docs1 = UnstructuredURLLoader(urls=f.readlines()).load()
-        add_meta(docs1, file)
-        doc1 = chunk_sources(docs1, chunk=chunk, chunk_size=chunk_size)
+            urls = f.readlines()
+            # recurse
+            doc1 = path_to_docs(None, url=urls, verbose=verbose, fail_any_exception=fail_any_exception, n_jobs=n_jobs,
+                                db_type=db_type)
     elif file.lower().endswith('.zip'):
         with zipfile.ZipFile(file, 'r') as zip_ref:
             # don't put into temporary path, since want to keep references to docs inside zip
             # so just extract in path where
             zip_ref.extractall(base_path)
             # recurse
-            doc1 = path_to_docs(base_path, verbose=verbose, fail_any_exception=fail_any_exception, n_jobs=n_jobs)
+            doc1 = path_to_docs(base_path, verbose=verbose, fail_any_exception=fail_any_exception, n_jobs=n_jobs,
+                                db_type=db_type)
     else:
         raise RuntimeError("No file handler for %s" % os.path.basename(file))
 
-    # allow doc1 to be list or not.  If not list, did not chunk yet, so chunk now
-    # if list of length one, don't trust and chunk it
+    # allow doc1 to be list or not.
     if not isinstance(doc1, list):
-        if chunk:
-            docs = chunk_sources([doc1], chunk=chunk, chunk_size=chunk_size)
-        else:
-            docs = [doc1]
+        # If not list, did not chunk yet, so chunk now
+        docs = chunk_sources([doc1])
     elif isinstance(doc1, list) and len(doc1) == 1:
-        if chunk:
-            docs = chunk_sources(doc1, chunk=chunk, chunk_size=chunk_size)
-        else:
-            docs = doc1
+        # if list of length one, don't trust and chunk it, chunk_id's will still be correct if repeat
+        docs = chunk_sources(doc1)
     else:
         docs = doc1
 
@@ -1344,7 +1652,10 @@ def path_to_doc1(file, verbose=False, fail_any_exception=False, return_file=True
                  is_url=False, is_txt=False,
                  enable_captions=True,
                  captions_model=None,
-                 enable_ocr=False, enable_pdf_ocr='auto', caption_loader=None):
+                 enable_ocr=False, enable_pdf_ocr='auto', caption_loader=None,
+                 db_type=None,
+                 selected_file_types=None):
+    assert db_type is not None
     if verbose:
         if is_url:
             print("Ingesting URL: %s" % file, flush=True)
@@ -1363,7 +1674,9 @@ def path_to_doc1(file, verbose=False, fail_any_exception=False, return_file=True
                           captions_model=captions_model,
                           enable_ocr=enable_ocr,
                           enable_pdf_ocr=enable_pdf_ocr,
-                          caption_loader=caption_loader)
+                          caption_loader=caption_loader,
+                          db_type=db_type,
+                          selected_file_types=selected_file_types)
     except BaseException as e:
         print("Failed to ingest %s due to %s" % (file, traceback.format_exc()))
         if fail_any_exception:
@@ -1377,7 +1690,7 @@ def path_to_doc1(file, verbose=False, fail_any_exception=False, return_file=True
     if return_file:
         base_tmp = "temp_path_to_doc1"
         if not os.path.isdir(base_tmp):
-            os.makedirs(base_tmp, exist_ok=True)
+            base_tmp = makedirs(base_tmp, exist_ok=True, tmp_ok=True, use_base=True)
         filename = os.path.join(base_tmp, str(uuid.uuid4()) + ".tmp.pickle")
         with open(filename, 'wb') as f:
             pickle.dump(res, f)
@@ -1395,13 +1708,24 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
                  enable_pdf_ocr='auto',
                  existing_files=[],
                  existing_hash_ids={},
+                 db_type=None,
+                 selected_file_types=None,
                  ):
+    if selected_file_types is not None:
+        non_image_types1 = [x for x in non_image_types if x in selected_file_types]
+        image_types1 = [x for x in image_types if x in selected_file_types]
+    else:
+        non_image_types1 = non_image_types.copy()
+        image_types1 = image_types.copy()
+
+    assert db_type is not None
     # path_or_paths could be str, list, tuple, generator
     globs_image_types = []
     globs_non_image_types = []
     if not path_or_paths and not url and not text:
         return []
     elif url:
+        url = get_list_or_str(url)
         globs_non_image_types = url if isinstance(url, (list, tuple, types.GeneratorType)) else [url]
     elif text:
         globs_non_image_types = text if isinstance(text, (list, tuple, types.GeneratorType)) else [text]
@@ -1410,9 +1734,11 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
         path = path_or_paths
         # Below globs should match patterns in file_to_doc()
         [globs_image_types.extend(glob.glob(os.path.join(path, "./**/*.%s" % ftype), recursive=True))
-         for ftype in image_types]
+         for ftype in image_types1]
+        globs_image_types = [os.path.normpath(x) for x in globs_image_types]
         [globs_non_image_types.extend(glob.glob(os.path.join(path, "./**/*.%s" % ftype), recursive=True))
-         for ftype in non_image_types]
+         for ftype in non_image_types1]
+        globs_non_image_types = [os.path.normpath(x) for x in globs_non_image_types]
     else:
         if isinstance(path_or_paths, str):
             if os.path.isfile(path_or_paths) or os.path.isdir(path_or_paths):
@@ -1424,12 +1750,13 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
         assert isinstance(path_or_paths, (list, tuple, types.GeneratorType)), \
             "Wrong type for path_or_paths: %s %s" % (path_or_paths, type(path_or_paths))
         # reform out of allowed types
-        globs_image_types.extend(flatten_list([[x for x in path_or_paths if x.endswith(y)] for y in image_types]))
+        globs_image_types.extend(
+            flatten_list([[os.path.normpath(x) for x in path_or_paths if x.endswith(y)] for y in image_types1]))
         # could do below:
-        # globs_non_image_types = flatten_list([[x for x in path_or_paths if x.endswith(y)] for y in non_image_types])
+        # globs_non_image_types = flatten_list([[x for x in path_or_paths if x.endswith(y)] for y in non_image_types1])
         # But instead, allow fail so can collect unsupported too
         set_globs_image_types = set(globs_image_types)
-        globs_non_image_types.extend([x for x in path_or_paths if x not in set_globs_image_types])
+        globs_non_image_types.extend([os.path.normpath(x) for x in path_or_paths if x not in set_globs_image_types])
 
     # filter out any files to skip (e.g. if already processed them)
     # this is easy, but too aggressive in case a file changed, so parent probably passed existing_files=[]
@@ -1475,6 +1802,8 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
                   caption_loader=caption_loader,
                   enable_ocr=enable_ocr,
                   enable_pdf_ocr=enable_pdf_ocr,
+                  db_type=db_type,
+                  selected_file_types=selected_file_types,
                   )
 
     if n_jobs != 1 and len(globs_non_image_types) > 1:
@@ -1516,7 +1845,9 @@ def path_to_docs(path_or_paths, verbose=False, fail_any_exception=False, n_jobs=
 def prep_langchain(persist_directory,
                    load_db_if_exists,
                    db_type, use_openai_embedding, langchain_mode, langchain_mode_paths,
-                   hf_embedding_model, n_jobs=-1, kwargs_make_db={}):
+                   hf_embedding_model,
+                   migrate_embedding_model,
+                   n_jobs=-1, kwargs_make_db={}):
     """
     do prep first time, involving downloads
     # FIXME: Add github caching then add here
@@ -1529,8 +1860,9 @@ def prep_langchain(persist_directory,
 
     if db_dir_exists and user_path is None:
         print("Prep: persist_directory=%s exists, using" % persist_directory, flush=True)
-        db = get_existing_db(None, persist_directory, load_db_if_exists, db_type, use_openai_embedding, langchain_mode,
-                             hf_embedding_model)
+        db, use_openai_embedding, hf_embedding_model = \
+            get_existing_db(None, persist_directory, load_db_if_exists, db_type, use_openai_embedding, langchain_mode,
+                            hf_embedding_model, migrate_embedding_model)
     else:
         if db_dir_exists and user_path is not None:
             print("Prep: persist_directory=%s exists, user_path=%s passed, adding any changed or new documents" % (
@@ -1580,9 +1912,12 @@ class FakeConsumer(object):
 posthog.Consumer = FakeConsumer
 
 
-def check_update_chroma_embedding(db, use_openai_embedding, hf_embedding_model, langchain_mode):
+def check_update_chroma_embedding(db, use_openai_embedding,
+                                  hf_embedding_model, migrate_embedding_model,
+                                  langchain_mode):
     changed_db = False
-    if load_embed(db) != (use_openai_embedding, hf_embedding_model):
+    if load_embed(db=db) not in [(True, use_openai_embedding, hf_embedding_model),
+                                 (False, use_openai_embedding, hf_embedding_model)]:
         print("Detected new embedding, updating db: %s" % langchain_mode, flush=True)
         # handle embedding changes
         db_get = get_documents(db)
@@ -1597,7 +1932,9 @@ def check_update_chroma_embedding(db, use_openai_embedding, hf_embedding_model, 
                     persist_directory=persist_directory, load_db_if_exists=load_db_if_exists,
                     langchain_mode=langchain_mode,
                     collection_name=None,
-                    hf_embedding_model=hf_embedding_model)
+                    hf_embedding_model=hf_embedding_model,
+                    migrate_embedding_model=migrate_embedding_model,
+                    )
         if False:
             # below doesn't work if db already in memory, so have to switch to new db as above
             # upsert does new embedding, but if index already in memory, complains about size mismatch etc.
@@ -1611,12 +1948,17 @@ def check_update_chroma_embedding(db, use_openai_embedding, hf_embedding_model, 
 
 
 def get_existing_db(db, persist_directory, load_db_if_exists, db_type, use_openai_embedding, langchain_mode,
-                    hf_embedding_model, verbose=False, check_embedding=True):
+                    hf_embedding_model,
+                    migrate_embedding_model,
+                    verbose=False, check_embedding=True):
     if load_db_if_exists and db_type == 'chroma' and os.path.isdir(persist_directory) and os.path.isdir(
             os.path.join(persist_directory, 'index')):
         if db is None:
             if verbose:
                 print("DO Loading db: %s" % langchain_mode, flush=True)
+            got_embedding, use_openai_embedding0, hf_embedding_model0 = load_embed(persist_directory=persist_directory)
+            if got_embedding:
+                use_openai_embedding, hf_embedding_model = use_openai_embedding0, hf_embedding_model0
             embedding = get_embedding(use_openai_embedding, hf_embedding_model=hf_embedding_model)
             from chromadb.config import Settings
             client_settings = Settings(anonymized_telemetry=False,
@@ -1628,10 +1970,15 @@ def get_existing_db(db, persist_directory, load_db_if_exists, db_type, use_opena
             if verbose:
                 print("DONE Loading db: %s" % langchain_mode, flush=True)
         else:
+            if not migrate_embedding_model:
+                # OVERRIDE embedding choices if could load embedding info when not migrating
+                got_embedding, use_openai_embedding, hf_embedding_model = load_embed(db=db)
             if verbose:
                 print("USING already-loaded db: %s" % langchain_mode, flush=True)
         if check_embedding:
-            db_trial, changed_db = check_update_chroma_embedding(db, use_openai_embedding, hf_embedding_model,
+            db_trial, changed_db = check_update_chroma_embedding(db, use_openai_embedding,
+                                                                 hf_embedding_model,
+                                                                 migrate_embedding_model,
                                                                  langchain_mode)
             if changed_db:
                 db = db_trial
@@ -1640,16 +1987,19 @@ def get_existing_db(db, persist_directory, load_db_if_exists, db_type, use_opena
                     db.persist()
                     clear_embedding(db)
         save_embed(db, use_openai_embedding, hf_embedding_model)
-        return db
-    return None
+        return db, use_openai_embedding, hf_embedding_model
+    return db, use_openai_embedding, hf_embedding_model
 
 
 def clear_embedding(db):
     if db is None:
         return
     # don't keep on GPU, wastes memory, push back onto CPU and only put back on GPU once again embed
-    db._embedding_function.client.cpu()
-    clear_torch_cache()
+    try:
+        db._embedding_function.client.cpu()
+        clear_torch_cache()
+    except RuntimeError as e:
+        print("clear_embedding error: %s" % ''.join(traceback.format_tb(e.__traceback__)), flush=True)
 
 
 def make_db(**langchain_kwargs):
@@ -1675,23 +2025,37 @@ def save_embed(db, use_openai_embedding, hf_embedding_model):
     return use_openai_embedding, hf_embedding_model
 
 
-def load_embed(db):
-    embed_info_file = os.path.join(db._persist_directory, 'embed_info')
+def load_embed(db=None, persist_directory=None):
+    if persist_directory is None:
+        persist_directory = db._persist_directory
+    embed_info_file = os.path.join(persist_directory, 'embed_info')
     if os.path.isfile(embed_info_file):
         with open(embed_info_file, 'rb') as f:
             use_openai_embedding, hf_embedding_model = pickle.load(f)
+        got_embedding = True
     else:
         # migration, assume defaults
         use_openai_embedding, hf_embedding_model = False, "sentence-transformers/all-MiniLM-L6-v2"
-    return use_openai_embedding, hf_embedding_model
+        got_embedding = False
+    return got_embedding, use_openai_embedding, hf_embedding_model
 
 
 def get_persist_directory(langchain_mode):
-    return 'db_dir_%s' % langchain_mode  # single place, no special names for each case
+    persist_directory = 'db_dir_%s' % langchain_mode  # single place, no special names for each case
+    persist_directory = makedirs(persist_directory, use_base=True)
+    return persist_directory
+
+
+scratch_base_dir = os.getenv('H2OGPT_SCRATCH_PATH', '/tmp/')
+
+
+def get_scratch_directory(langchain_mode, db1):
+    return os.path.join(scratch_base_dir, 'db_dir_%s_%s' % (langchain_mode, db1[1]))
 
 
 def _make_db(use_openai_embedding=False,
-             hf_embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+             hf_embedding_model=None,
+             migrate_embedding_model=False,
              first_para=False, text_limit=None,
              chunk=True, chunk_size=512,
              langchain_mode=None,
@@ -1701,16 +2065,19 @@ def _make_db(use_openai_embedding=False,
              db=None,
              n_jobs=-1,
              verbose=False):
+    assert hf_embedding_model is not None
     persist_directory = get_persist_directory(langchain_mode)
     user_path = langchain_mode_paths.get(langchain_mode)
     # see if can get persistent chroma db
-    db_trial = get_existing_db(db, persist_directory, load_db_if_exists, db_type, use_openai_embedding, langchain_mode,
-                               hf_embedding_model, verbose=verbose)
+    db_trial, use_openai_embedding, hf_embedding_model = \
+        get_existing_db(db, persist_directory, load_db_if_exists, db_type, use_openai_embedding, langchain_mode,
+                        hf_embedding_model, migrate_embedding_model, verbose=verbose)
     if db_trial is not None:
         db = db_trial
 
     sources = []
     if not db:
+        chunk_sources = functools.partial(_chunk_sources, chunk=chunk, chunk_size=chunk_size, db_type=db_type)
         if langchain_mode in ['wiki_full']:
             from read_wiki_full import get_all_documents
             small_test = None
@@ -1718,24 +2085,24 @@ def _make_db(use_openai_embedding=False,
             sources1 = get_all_documents(small_test=small_test, n_jobs=os.cpu_count() // 2)
             print("Got new wiki", flush=True)
             if chunk:
-                sources1 = chunk_sources(sources1, chunk=chunk, chunk_size=chunk_size)
+                sources1 = chunk_sources(sources1)
                 print("Chunked new wiki", flush=True)
             sources.extend(sources1)
         elif langchain_mode in ['wiki']:
             sources1 = get_wiki_sources(first_para=first_para, text_limit=text_limit)
             if chunk:
-                sources1 = chunk_sources(sources1, chunk=chunk, chunk_size=chunk_size)
+                sources1 = chunk_sources(sources1)
             sources.extend(sources1)
         elif langchain_mode in ['github h2oGPT']:
             # sources = get_github_docs("dagster-io", "dagster")
             sources1 = get_github_docs("h2oai", "h2ogpt")
             # FIXME: always chunk for now
-            sources1 = chunk_sources(sources1, chunk=chunk, chunk_size=chunk_size)
+            sources1 = chunk_sources(sources1)
             sources.extend(sources1)
         elif langchain_mode in ['DriverlessAI docs']:
             sources1 = get_dai_docs(from_hf=True)
             if chunk and False:  # FIXME: DAI docs are already chunked well, should only chunk more if over limit
-                sources1 = chunk_sources(sources1, chunk=chunk, chunk_size=chunk_size)
+                sources1 = chunk_sources(sources1)
             sources.extend(sources1)
     if user_path:
         # UserData or custom, which has to be from user's disk
@@ -1752,14 +2119,21 @@ def _make_db(use_openai_embedding=False,
         # FIXME: If first had old Hash=None and switch embeddings,
         #  then re-embed, and then hit here and reload so have hash, and then re-embed.
         sources1 = path_to_docs(user_path, n_jobs=n_jobs, chunk=chunk, chunk_size=chunk_size,
-                                existing_files=existing_files, existing_hash_ids=existing_hash_ids)
+                                existing_files=existing_files, existing_hash_ids=existing_hash_ids,
+                                db_type=db_type)
         new_metadata_sources = set([x.metadata['source'] for x in sources1])
         if new_metadata_sources:
+            if os.getenv('NO_NEW_FILES') is not None:
+                raise RuntimeError("Expected no new files! %s" % new_metadata_sources)
             print("Loaded %s new files as sources to add to %s" % (len(new_metadata_sources), langchain_mode),
                   flush=True)
             if verbose:
                 print("Files added: %s" % '\n'.join(new_metadata_sources), flush=True)
         sources.extend(sources1)
+        if len(sources) > 0 and os.getenv('NO_NEW_FILES') is not None:
+            raise RuntimeError("Expected no new files! %s" % langchain_mode)
+        if len(sources) == 0 and os.getenv('SHOULD_NEW_FILES') is not None:
+            raise RuntimeError("Expected new files! %s" % langchain_mode)
         print("Loaded %s sources for potentially adding to %s" % (len(sources), langchain_mode), flush=True)
 
         # see if got sources
@@ -1779,7 +2153,8 @@ def _make_db(use_openai_embedding=False,
         if sources:
             db = get_db(sources, use_openai_embedding=use_openai_embedding, db_type=db_type,
                         persist_directory=persist_directory, langchain_mode=langchain_mode,
-                        hf_embedding_model=hf_embedding_model)
+                        hf_embedding_model=hf_embedding_model,
+                        migrate_embedding_model=migrate_embedding_model)
             if verbose:
                 print("Generated db", flush=True)
         else:
@@ -1814,7 +2189,7 @@ def get_documents(db):
     if hasattr(db, '_persist_directory'):
         name_path = os.path.basename(db._persist_directory)
         base_path = 'locks'
-        makedirs(base_path)
+        base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
         with filelock.FileLock(os.path.join(base_path, "getdb_%s.lock" % name_path)):
             # get segfaults and other errors when multiple threads access this
             return _get_documents(db)
@@ -1839,7 +2214,7 @@ def get_docs_and_meta(db, top_k_docs, filter_kwargs={}):
     if hasattr(db, '_persist_directory'):
         name_path = os.path.basename(db._persist_directory)
         base_path = 'locks'
-        makedirs(base_path)
+        base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
         with filelock.FileLock(os.path.join(base_path, "getdb_%s.lock" % name_path)):
             return _get_docs_and_meta(db, top_k_docs, filter_kwargs=filter_kwargs)
     else:
@@ -1856,8 +2231,11 @@ def _get_docs_and_meta(db, top_k_docs, filter_kwargs={}):
         import itertools
         db_metadatas = get_metadatas(db)
         # FIXME: FAISS has no filter
-        # slice dict first
-        db_documents = list(dict(itertools.islice(db.docstore._dict.items(), top_k_docs)).values())
+        if top_k_docs == -1:
+            db_documents = list(db.docstore._dict.values())
+        else:
+            # slice dict first
+            db_documents = list(dict(itertools.islice(db.docstore._dict.items(), top_k_docs)).values())
     else:
         db_metadatas = get_metadatas(db)
         db_documents = get_documents(db)
@@ -1873,15 +2251,15 @@ def get_existing_files(db):
 def get_existing_hash_ids(db):
     metadatas = get_metadatas(db)
     # assume consistency, that any prior hashed source was single hashed file at the time among all source chunks
-    metadata_hash_ids = {x['source']: x.get('hashid') for x in metadatas}
+    metadata_hash_ids = {os.path.normpath(x['source']): x.get('hashid') for x in metadatas}
     return metadata_hash_ids
 
 
 def run_qa_db(**kwargs):
     func_names = list(inspect.signature(_run_qa_db).parameters)
     # hard-coded defaults
-    kwargs['answer_with_sources'] = True
-    kwargs['show_rank'] = False
+    kwargs['answer_with_sources'] = kwargs.get('answer_with_sources', True)
+    kwargs['show_rank'] = kwargs.get('show_rank', False)
     missing_kwargs = [x for x in func_names if x not in kwargs]
     assert not missing_kwargs, "Missing kwargs for run_qa_db: %s" % missing_kwargs
     # only keep actual used
@@ -1899,19 +2277,25 @@ def _run_qa_db(query=None,
                first_para=False, text_limit=None, top_k_docs=4, chunk=True, chunk_size=512,
                langchain_mode_paths={},
                detect_user_path_changes_every_query=False,
-               db_type='faiss',
+               db_type=None,
                model_name=None, model=None, tokenizer=None, inference_server=None,
-               hf_embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+               langchain_only_model=False,
+               hf_embedding_model=None,
+               migrate_embedding_model=False,
                stream_output=False,
+               async_output=True,
+               num_async=3,
                prompter=None,
                prompt_type=None,
                prompt_dict=None,
                answer_with_sources=True,
+               append_sources_to_answer=True,
                cut_distance=1.64,
                add_chat_history_to_context=True,
+               system_prompt='',
                sanitize_bot_response=False,
                show_rank=False,
-               use_llm_if_no_docs=False,
+               use_llm_if_no_docs=True,
                load_db_if_exists=False,
                db=None,
                do_sample=False,
@@ -1919,7 +2303,7 @@ def _run_qa_db(query=None,
                top_k=40,
                top_p=0.7,
                num_beams=1,
-               max_new_tokens=256,
+               max_new_tokens=512,
                min_new_tokens=1,
                early_stopping=False,
                max_time=180,
@@ -1930,6 +2314,8 @@ def _run_qa_db(query=None,
                langchain_agents=None,
                document_subset=DocumentSubset.Relevant.name,
                document_choice=[DocumentChoice.ALL.value],
+               pre_prompt_summary=None,
+               prompt_summary=None,
                n_jobs=-1,
                verbose=False,
                cli=False,
@@ -1956,6 +2342,16 @@ def _run_qa_db(query=None,
     :param answer_with_sources
     :return:
     """
+    t_run = time.time()
+    if stream_output:
+        # threads and asyncio don't mix
+        async_output = False
+    if langchain_action in [LangChainAction.QUERY.value]:
+        # only summarization supported
+        async_output = False
+
+    assert db_type is not None
+    assert hf_embedding_model is not None
     assert langchain_mode_paths is not None
     if model is not None:
         assert model_name is not None  # require so can make decisions
@@ -1973,30 +2369,37 @@ def _run_qa_db(query=None,
     assert len(set(gen_hyper).difference(inspect.signature(get_llm).parameters)) == 0
     # pass in context to LLM directly, since already has prompt_type structure
     # can't pass through langchain in get_chain() to LLM: https://github.com/hwchase17/langchain/issues/6638
-    llm, model_name, streamer, prompt_type_out = get_llm(use_openai_model=use_openai_model, model_name=model_name,
-                                                         model=model,
-                                                         tokenizer=tokenizer,
-                                                         inference_server=inference_server,
-                                                         stream_output=stream_output,
-                                                         do_sample=do_sample,
-                                                         temperature=temperature,
-                                                         top_k=top_k,
-                                                         top_p=top_p,
-                                                         num_beams=num_beams,
-                                                         max_new_tokens=max_new_tokens,
-                                                         min_new_tokens=min_new_tokens,
-                                                         early_stopping=early_stopping,
-                                                         max_time=max_time,
-                                                         repetition_penalty=repetition_penalty,
-                                                         num_return_sequences=num_return_sequences,
-                                                         prompt_type=prompt_type,
-                                                         prompt_dict=prompt_dict,
-                                                         prompter=prompter,
-                                                         context=context if add_chat_history_to_context else '',
-                                                         iinput=iinput if add_chat_history_to_context else '',
-                                                         sanitize_bot_response=sanitize_bot_response,
-                                                         verbose=verbose,
-                                                         )
+    llm, model_name, streamer, prompt_type_out, async_output = \
+        get_llm(use_openai_model=use_openai_model, model_name=model_name,
+                model=model,
+                tokenizer=tokenizer,
+                inference_server=inference_server,
+                langchain_only_model=langchain_only_model,
+                stream_output=stream_output,
+                async_output=async_output,
+                num_async=num_async,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                num_beams=num_beams,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                early_stopping=early_stopping,
+                max_time=max_time,
+                repetition_penalty=repetition_penalty,
+                num_return_sequences=num_return_sequences,
+                prompt_type=prompt_type,
+                prompt_dict=prompt_dict,
+                prompter=prompter,
+                context=context if add_chat_history_to_context else '',
+                iinput=iinput if add_chat_history_to_context else '',
+                sanitize_bot_response=sanitize_bot_response,
+                system_prompt=system_prompt,
+                n_jobs=n_jobs,
+                cli=cli,
+                verbose=verbose,
+                )
 
     use_docs_planned = False
     scores = []
@@ -2029,12 +2432,12 @@ def _run_qa_db(query=None,
             return
         if not docs and langchain_mode not in [LangChainMode.DISABLED.value,
                                                LangChainMode.LLM.value]:
-            ret = 'No relevant documents to query.' if have_any_docs else 'No documents to query.'
+            ret = 'No relevant documents to query (for chatting with LLM, pick Resources->Collections->LLM).' if have_any_docs else 'No documents to query (for chatting with LLM, pick Resources->Collections->LLM).'
             extra = ''
             yield ret, extra
             return
 
-    if chain is None and model_name not in non_hf_types:
+    if chain is None and not langchain_only_model:
         # here if no docs at all and not HF type
         # can only return if HF type
         return
@@ -2075,22 +2478,63 @@ def _run_qa_db(query=None,
                     # in case no exception and didn't join with thread yet, then join
                     if not thread.exc:
                         answer = thread.join()
+                        answer = answer['output_text']
                 # in case raise StopIteration or broke queue loop in streamer, but still have exception
                 if thread.exc:
                     raise thread.exc
-                # FIXME: answer is not string outputs from streamer.  How to get actual final output?
-                # answer = outputs
             else:
-                answer = chain()
+                if async_output:
+                    import asyncio
+                    answer = asyncio.run(chain())
+                else:
+                    answer = chain()
+                    answer = answer['output_text']
 
+    t_run = time.time() - t_run
     if not use_docs_planned:
-        ret = answer['output_text']
+        ret = answer
         extra = ''
         yield ret, extra
     elif answer is not None:
-        ret, extra = get_sources_answer(query, answer, scores, show_rank, answer_with_sources, verbose=verbose)
+        ret, extra = get_sources_answer(query, docs, answer, scores, show_rank,
+                                        answer_with_sources,
+                                        append_sources_to_answer,
+                                        verbose=verbose,
+                                        t_run=t_run,
+                                        count_input_tokens=llm.count_input_tokens
+                                        if hasattr(llm, 'count_input_tokens') else None,
+                                        count_output_tokens=llm.count_output_tokens
+                                        if hasattr(llm, 'count_output_tokens') else None)
         yield ret, extra
     return
+
+
+def get_docs_with_score(query, k_db, filter_kwargs, db, db_type, verbose=False):
+    # deal with bug in chroma where if (say) 234 doc chunks and ask for 233+ then fails due to reduction misbehavior
+    docs_with_score = []
+    if db_type == 'chroma':
+        while True:
+            try:
+                docs_with_score = db.similarity_search_with_score(query, k=k_db, **filter_kwargs)
+                break
+            except (RuntimeError, AttributeError) as e:
+                # AttributeError is for people with wrong version of langchain
+                if verbose:
+                    print("chroma bug: %s" % str(e), flush=True)
+                if k_db == 1:
+                    raise
+                if k_db > 500:
+                    k_db -= 200
+                elif k_db > 100:
+                    k_db -= 50
+                elif k_db > 10:
+                    k_db -= 5
+                else:
+                    k_db -= 1
+                k_db = max(1, k_db)
+    else:
+        docs_with_score = db.similarity_search_with_score(query, k=k_db, **filter_kwargs)
+    return docs_with_score
 
 
 def get_chain(query=None,
@@ -2103,7 +2547,9 @@ def get_chain(query=None,
               db_type='faiss',
               model_name=None,
               inference_server='',
-              hf_embedding_model="sentence-transformers/all-MiniLM-L6-v2",
+              langchain_only_model=False,
+              hf_embedding_model=None,
+              migrate_embedding_model=False,
               prompt_type=None,
               prompt_dict=None,
               cut_distance=1.1,
@@ -2115,20 +2561,25 @@ def get_chain(query=None,
               langchain_agents=None,
               document_subset=DocumentSubset.Relevant.name,
               document_choice=[DocumentChoice.ALL.value],
+              pre_prompt_summary=None,
+              prompt_summary=None,
               n_jobs=-1,
               # beyond run_db_query:
               llm=None,
               tokenizer=None,
               verbose=False,
               reverse_docs=True,
+              stream_output=True,
+              async_output=True,
 
               # local
               auto_reduce_chunks=True,
               max_chunks=100,
               ):
+    assert hf_embedding_model is not None
     assert langchain_agents is not None  # should be at least []
     # determine whether use of context out of docs is planned
-    if not use_openai_model and prompt_type not in ['plain'] or model_name in non_hf_types:
+    if not use_openai_model and prompt_type not in ['plain'] or langchain_only_model:
         if langchain_mode in ['Disabled', 'LLM']:
             use_docs_planned = False
         else:
@@ -2155,8 +2606,11 @@ def get_chain(query=None,
             langchain_mode_paths = {}
         langchain_mode_paths = langchain_mode_paths.copy()
         langchain_mode_paths[langchain_mode] = None
+    # once use_openai_embedding, hf_embedding_model passed in, possibly changed,
+    # but that's ok as not used below or in calling functions
     db, num_new_sources, new_sources_metadata = make_db(use_openai_embedding=use_openai_embedding,
                                                         hf_embedding_model=hf_embedding_model,
+                                                        migrate_embedding_model=migrate_embedding_model,
                                                         first_para=first_para, text_limit=text_limit,
                                                         chunk=chunk,
                                                         chunk_size=chunk_size,
@@ -2172,44 +2626,48 @@ def get_chain(query=None,
         if iinput:
             query = "%s\n%s" % (query, iinput)
 
-        if 'falcon' in model_name:
+        if 'falcon' in model_name or 'Llama-2'.lower() in model_name.lower():
             extra = "According to only the information in the document sources provided within the context above, "
-            prefix = "Pay attention and remember information below, which will help to answer the question or imperative after the context ends."
+            prefix = "Pay attention and remember information below, which will help to answer the question or imperative after the context ends.\n"
         elif inference_server in ['openai', 'openai_chat']:
             extra = "According to (primarily) the information in the document sources provided within context above, "
-            prefix = "Pay attention and remember information below, which will help to answer the question or imperative after the context ends.  If the answer cannot be primarily obtained from information within the context, then respond that the answer does not appear in the context of the documents."
+            prefix = "Pay attention and remember information below, which will help to answer the question or imperative after the context ends.  If the answer cannot be primarily obtained from information within the context, then respond that the answer does not appear in the context of the documents.\n"
         else:
             extra = ""
             prefix = ""
         if langchain_mode in ['Disabled', 'LLM'] or not use_docs_planned:
-            template_if_no_docs = template = """%s{context}{question}""" % prefix
+            template_if_no_docs = template = """{context}{question}"""
         else:
             template = """%s
     \"\"\"
     {context}
     \"\"\"
     %s{question}""" % (prefix, extra)
-            template_if_no_docs = """%s{context}%s{question}""" % (prefix, extra)
+            template_if_no_docs = """{context}{question}"""
     elif langchain_action in [LangChainAction.SUMMARIZE_ALL.value, LangChainAction.SUMMARIZE_MAP.value]:
         none = ['', '\n', None]
-        if query in none and iinput in none:
-            prompt_summary = "Using only the text above, write a condensed and concise summary:\n"
-        elif query not in none:
-            prompt_summary = "Focusing on %s, write a condensed and concise Summary:\n" % query
-        elif iinput not in None:
-            prompt_summary = iinput
-        else:
-            prompt_summary = "Focusing on %s, %s:\n" % (query, iinput)
+
+        if not pre_prompt_summary:
+            pre_prompt_summary = """In order to write a concise single-paragraph or bulleted list summary, pay attention to the following text\n"""
+        if not prompt_summary:
+            if query in none and iinput in none:
+                prompt_summary = "Using only the text above, write a condensed and concise summary of key results (preferably as bullet points):\n"
+            elif query not in none:
+                prompt_summary = "Focusing on %s, write a condensed and concise Summary:\n" % query
+            elif iinput not in None:
+                prompt_summary = iinput
+            else:
+                prompt_summary = "Focusing on %s, %s:\n" % (query, iinput)
         # don't auto reduce
         auto_reduce_chunks = False
         if langchain_action == LangChainAction.SUMMARIZE_MAP.value:
             fstring = '{text}'
         else:
             fstring = '{input_documents}'
-        template = """In order to write a concise single-paragraph or bulleted list summary, pay attention to the following text:
+        template = """%s:
 \"\"\"
 %s
-\"\"\"\n%s""" % (fstring, prompt_summary)
+\"\"\"\n%s""" % (pre_prompt_summary, fstring, prompt_summary)
         template_if_no_docs = "Exactly only say: There are no documents to summarize."
     elif langchain_action in [LangChainAction.SUMMARIZE_REFINE]:
         template = ''  # unused
@@ -2217,14 +2675,37 @@ def get_chain(query=None,
     else:
         raise RuntimeError("No such langchain_action=%s" % langchain_action)
 
-    if not use_openai_model and prompt_type not in ['plain'] or model_name in non_hf_types:
+    if not use_openai_model and prompt_type not in ['plain'] or langchain_only_model:
         use_template = True
     else:
         use_template = False
 
+    query_action = langchain_action == LangChainAction.QUERY.value
+    summarize_action = langchain_action in [LangChainAction.SUMMARIZE_MAP.value,
+                                            LangChainAction.SUMMARIZE_ALL.value,
+                                            LangChainAction.SUMMARIZE_REFINE.value]
+
+    if hasattr(llm, 'pipeline') and hasattr(llm.pipeline, 'max_input_tokens'):
+        max_input_tokens = llm.pipeline.max_input_tokens
+    elif inference_server in ['openai']:
+        max_tokens = llm.modelname_to_contextsize(model_name)
+        # leave some room for 1 paragraph, even if min_new_tokens=0
+        max_input_tokens = max_tokens - 256
+    elif inference_server in ['openai_chat']:
+        max_tokens = model_token_mapping[model_name]
+        # leave some room for 1 paragraph, even if min_new_tokens=0
+        max_input_tokens = max_tokens - 256
+    elif isinstance(tokenizer, FakeTokenizer):
+        max_input_tokens = tokenizer.model_max_length - 256
+    elif hasattr(tokenizer, 'model_max_length'):
+        max_input_tokens = tokenizer.model_max_length - 256
+    else:
+        # leave some room for 1 paragraph, even if min_new_tokens=0
+        max_input_tokens = 2048 - 256
+
     if db and use_docs_planned:
         base_path = 'locks'
-        makedirs(base_path)
+        base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
         if hasattr(db, '_persist_directory'):
             name_path = "sim_%s.lock" % os.path.basename(db._persist_directory)
         else:
@@ -2237,16 +2718,22 @@ def get_chain(query=None,
         else:
             assert document_choice is not None, "Document choice was None"
             if len(document_choice) >= 1 and document_choice[0] == DocumentChoice.ALL.value:
-                filter_kwargs = {}
+                filter_kwargs = {"chunk_id": {"$gte": 0}} if query_action else {"chunk_id": {"$eq": -1}}
             elif len(document_choice) >= 2:
                 if document_choice[0] == DocumentChoice.ALL.value:
                     # remove 'All'
                     document_choice = document_choice[1:]
-                or_filter = [{"source": {"$eq": x}} for x in document_choice]
+                or_filter = [{"source": {"$eq": x}, "chunk_id": {"$gte": 0}} if query_action else {"source": {"$eq": x},
+                                                                                                  "chunk_id": {
+                                                                                                      "$eq": -1}}
+                             for x in document_choice]
                 filter_kwargs = dict(filter={"$or": or_filter})
             elif len(document_choice) == 1:
                 # degenerate UX bug in chroma
-                one_filter = [{"source": {"$eq": x}} for x in document_choice][0]
+                one_filter = [{"source": {"$eq": x}, "chunk_id": {"$gte": 0}} if query_action else {"source": {"$eq": x},
+                                                                                                   "chunk_id": {
+                                                                                                       "$eq": -1}}
+                              for x in document_choice][0]
                 filter_kwargs = dict(filter=one_filter)
             else:
                 # shouldn't reach
@@ -2256,16 +2743,26 @@ def get_chain(query=None,
             scores = []
         elif document_subset == DocumentSubset.TopKSources.name or query in [None, '', '\n']:
             db_documents, db_metadatas = get_docs_and_meta(db, top_k_docs, filter_kwargs=filter_kwargs)
+            if top_k_docs == -1:
+                top_k_docs = len(db_documents)
             # similar to langchain's chroma's _results_to_docs_and_scores
             docs_with_score = [(Document(page_content=result[0], metadata=result[1] or {}), 0)
                                for result in zip(db_documents, db_metadatas)]
 
             # order documents
             doc_hashes = [x.get('doc_hash', 'None') for x in db_metadatas]
-            doc_chunk_ids = [x.get('chunk_id', 0) for x in db_metadatas]
-            docs_with_score = [x for _, _, x in
-                               sorted(zip(doc_hashes, doc_chunk_ids, docs_with_score), key=lambda x: (x[0], x[1]))
-                               ]
+            if query_action:
+                doc_chunk_ids = [x.get('chunk_id', 0) for x in db_metadatas]
+                docs_with_score = [x for hx, cx, x in
+                                   sorted(zip(doc_hashes, doc_chunk_ids, docs_with_score), key=lambda x: (x[0], x[1]))
+                                   if cx >= 0]
+            else:
+                assert summarize_action
+                doc_chunk_ids = [x.get('chunk_id', -1) for x in db_metadatas]
+                docs_with_score = [x for hx, cx, x in
+                                   sorted(zip(doc_hashes, doc_chunk_ids, docs_with_score), key=lambda x: (x[0], x[1]))
+                                   if cx == -1
+                                   ]
 
             docs_with_score = docs_with_score[:top_k_docs]
             docs = [x[0] for x in docs_with_score]
@@ -2275,10 +2772,9 @@ def get_chain(query=None,
             # FIXME: if langchain_action == LangChainAction.SUMMARIZE_MAP.value
             # if map_reduce, then no need to auto reduce chunks
             if top_k_docs == -1 or auto_reduce_chunks:
-                # docs_with_score = db.similarity_search_with_score(query, k=k_db, **filter_kwargs)[:top_k_docs]
                 top_k_docs_tokenize = 100
                 with filelock.FileLock(lock_file):
-                    docs_with_score = db.similarity_search_with_score(query, k=k_db, **filter_kwargs)[
+                    docs_with_score = get_docs_with_score(query, k_db, filter_kwargs, db, db_type, verbose=verbose)[
                                       :top_k_docs_tokenize]
                 if hasattr(llm, 'pipeline') and hasattr(llm.pipeline, 'tokenizer'):
                     # more accurate
@@ -2298,21 +2794,6 @@ def get_chain(query=None,
                               docs_with_score]
                     template_tokens = db._embedding_function.client.tokenize([template])['input_ids'].shape[1]
                 tokens_cumsum = np.cumsum(tokens)
-                if hasattr(llm, 'pipeline') and hasattr(llm.pipeline, 'max_input_tokens'):
-                    max_input_tokens = llm.pipeline.max_input_tokens
-                elif inference_server in ['openai']:
-                    max_tokens = llm.modelname_to_contextsize(model_name)
-                    # leave some room for 1 paragraph, even if min_new_tokens=0
-                    max_input_tokens = max_tokens - 256
-                elif inference_server in ['openai_chat']:
-                    max_tokens = model_token_mapping[model_name]
-                    # leave some room for 1 paragraph, even if min_new_tokens=0
-                    max_input_tokens = max_tokens - 256
-                elif isinstance(tokenizer, FakeTokenizer):
-                    max_input_tokens = tokenizer.model_max_length - 256
-                else:
-                    # leave some room for 1 paragraph, even if min_new_tokens=0
-                    max_input_tokens = 2048 - 256
                 max_input_tokens -= template_tokens
                 # FIXME: Doesn't account for query, == context, or new lines between contexts
                 where_res = np.where(tokens_cumsum < max_input_tokens)[0]
@@ -2334,7 +2815,8 @@ def get_chain(query=None,
                 docs_with_score = docs_with_score[:top_k_docs]
             else:
                 with filelock.FileLock(lock_file):
-                    docs_with_score = db.similarity_search_with_score(query, k=k_db, **filter_kwargs)[:top_k_docs]
+                    docs_with_score = get_docs_with_score(query, k_db, filter_kwargs, db, db_type, verbose=verbose)[
+                                      :top_k_docs]
             # put most relevant chunks closest to question,
             # esp. if truncation occurs will be "oldest" or "farthest from response" text that is truncated
             # BUT: for small models, e.g. 6_9 pythia, if sees some stuff related to h2oGPT first, it can connect that and not listen to rest
@@ -2351,7 +2833,7 @@ def get_chain(query=None,
         docs = []
         scores = []
 
-    if not docs and use_docs_planned and model_name not in non_hf_types:
+    if not docs and use_docs_planned and not langchain_only_model:
         # if HF type and have no docs, can bail out
         return docs, None, [], False, have_any_docs
 
@@ -2386,7 +2868,7 @@ def get_chain(query=None,
                 input_variables=["context", "question"],
                 template=template,
             )
-            chain = load_qa_chain(llm, prompt=prompt)
+            chain = load_qa_chain(llm, prompt=prompt, verbose=verbose)
         else:
             # only if use_openai_model = True, unused normally except in testing
             chain = load_qa_with_sources_chain(llm)
@@ -2398,20 +2880,40 @@ def get_chain(query=None,
     elif langchain_action in [LangChainAction.SUMMARIZE_MAP.value,
                               LangChainAction.SUMMARIZE_REFINE,
                               LangChainAction.SUMMARIZE_ALL.value]:
+        if async_output:
+            return_intermediate_steps = False
+        else:
+            return_intermediate_steps = True
         from langchain.chains.summarize import load_summarize_chain
         if langchain_action == LangChainAction.SUMMARIZE_MAP.value:
             prompt = PromptTemplate(input_variables=["text"], template=template)
             chain = load_summarize_chain(llm, chain_type="map_reduce",
-                                         map_prompt=prompt, combine_prompt=prompt, return_intermediate_steps=True)
-            target = wrapped_partial(chain, {"input_documents": docs})  # , return_only_outputs=True)
+                                         map_prompt=prompt, combine_prompt=prompt,
+                                         return_intermediate_steps=return_intermediate_steps,
+                                         token_max=max_input_tokens, verbose=verbose)
+            if async_output:
+                chain_func = chain.arun
+            else:
+                chain_func = chain
+            target = wrapped_partial(chain_func, {"input_documents": docs})  # , return_only_outputs=True)
         elif langchain_action == LangChainAction.SUMMARIZE_ALL.value:
             assert use_template
             prompt = PromptTemplate(input_variables=["text"], template=template)
-            chain = load_summarize_chain(llm, chain_type="stuff", prompt=prompt, return_intermediate_steps=True)
-            target = wrapped_partial(chain)
+            chain = load_summarize_chain(llm, chain_type="stuff", prompt=prompt,
+                                         return_intermediate_steps=return_intermediate_steps, verbose=verbose)
+            if async_output:
+                chain_func = chain.arun
+            else:
+                chain_func = chain
+            target = wrapped_partial(chain_func)
         elif langchain_action == LangChainAction.SUMMARIZE_REFINE.value:
-            chain = load_summarize_chain(llm, chain_type="refine", return_intermediate_steps=True)
-            target = wrapped_partial(chain)
+            chain = load_summarize_chain(llm, chain_type="refine",
+                                         return_intermediate_steps=return_intermediate_steps, verbose=verbose)
+            if async_output:
+                chain_func = chain.arun
+            else:
+                chain_func = chain
+            target = wrapped_partial(chain_func)
         else:
             raise RuntimeError("No such langchain_action=%s" % langchain_action)
     else:
@@ -2420,19 +2922,22 @@ def get_chain(query=None,
     return docs, target, scores, use_docs_planned, have_any_docs
 
 
-def get_sources_answer(query, answer, scores, show_rank, answer_with_sources, verbose=False):
+def get_sources_answer(query, docs, answer, scores, show_rank,
+                       answer_with_sources, append_sources_to_answer,
+                       verbose=False,
+                       t_run=None,
+                       count_input_tokens=None, count_output_tokens=None):
     if verbose:
         print("query: %s" % query, flush=True)
-        print("answer: %s" % answer['output_text'], flush=True)
+        print("answer: %s" % answer, flush=True)
 
-    if len(answer['input_documents']) == 0:
+    if len(docs) == 0:
         extra = ''
-        ret = answer['output_text'] + extra
+        ret = answer + extra
         return ret, extra
 
     # link
-    answer_sources = [(max(0.0, 1.5 - score) / 1.5, get_url(doc)) for score, doc in
-                      zip(scores, answer['input_documents'])]
+    answer_sources = [(max(0.0, 1.5 - score) / 1.5, get_url(doc)) for score, doc in zip(scores, docs)]
     answer_sources_dict = defaultdict(list)
     [answer_sources_dict[url].append(score) for score, url in answer_sources]
     answers_dict = {}
@@ -2448,16 +2953,23 @@ def get_sources_answer(query, answer, scores, show_rank, answer_with_sources, ve
     else:
         answer_sources = ['<li>%.2g | %s</li>' % (score, url) for score, url in answer_sources]
         sorted_sources_urls = f"{source_prefix}<p><ul>" + "<p>".join(answer_sources)
+        if int(t_run):
+            sorted_sources_urls += 'Total Time: %d [s]<p>' % t_run
+        if count_input_tokens and count_output_tokens:
+            sorted_sources_urls += 'Input Tokens: %s | Output Tokens: %d<p>' % (count_input_tokens, count_output_tokens)
         sorted_sources_urls += f"</ul></p>{source_postfix}"
 
-    if not answer['output_text'].endswith('\n'):
-        answer['output_text'] += '\n'
+    if not answer.endswith('\n'):
+        answer += '\n'
 
     if answer_with_sources:
         extra = '\n' + sorted_sources_urls
     else:
         extra = ''
-    ret = answer['output_text'] + extra
+    if append_sources_to_answer:
+        ret = answer + extra
+    else:
+        ret = answer
     return ret, extra
 
 
@@ -2469,13 +2981,24 @@ def clean_doc(docs1):
     return docs1
 
 
-def chunk_sources(sources, chunk=True, chunk_size=512, language=None):
-    if not chunk:
-        [x.metadata.update(dict(chunk_id=chunk_id)) for chunk_id, x in enumerate(sources)]
-        return sources
+def clone_documents(documents: Iterable[Document]) -> List[Document]:
+    # first clone documents
+    new_docs = []
+    for doc in documents:
+        new_doc = Document(page_content=doc.page_content, metadata=copy.deepcopy(doc.metadata))
+        new_docs.append(new_doc)
+    return new_docs
+
+
+def _chunk_sources(sources, chunk=True, chunk_size=512, language=None, db_type=None):
+    assert db_type is not None
+
     if not isinstance(sources, (list, tuple, types.GeneratorType)) and not callable(sources):
         # if just one document
         sources = [sources]
+    if not chunk:
+        [x.metadata.update(dict(chunk_id=0)) for chunk_id, x in enumerate(sources)]
+        return sources
     if language and False:
         # Bug in langchain, keep separator=True not working
         # https://github.com/hwchase17/langchain/issues/2836
@@ -2492,13 +3015,23 @@ def chunk_sources(sources, chunk=True, chunk_size=512, language=None):
     # currently in order, but when pull from db won't be, so mark order and document by hash
     [x.metadata.update(dict(chunk_id=chunk_id)) for chunk_id, x in enumerate(source_chunks)]
 
-    return source_chunks
+    if db_type == 'chroma':
+        # also keep original source for summarization and other tasks
+
+        # assign chunk_id=-1 for original content
+        # this assumes, as is currently true, that splitter makes new documents and list and metadata is deepcopy
+        [x.metadata.update(dict(chunk_id=-1)) for chunk_id, x in enumerate(sources)]
+
+        # in some cases sources is generator, so convert to list
+        return list(sources) + source_chunks
+    else:
+        return source_chunks
 
 
 def get_db_from_hf(dest=".", db_dir='db_dir_DriverlessAI_docs.zip'):
     from huggingface_hub import hf_hub_download
     # True for case when locally already logged in with correct token, so don't have to set key
-    token = os.getenv('HUGGINGFACE_API_TOKEN', True)
+    token = os.getenv('HUGGING_FACE_HUB_TOKEN', True)
     path_to_zip_file = hf_hub_download('h2oai/db_dirs', db_dir, token=token, repo_type='dataset')
     import zipfile
     with zipfile.ZipFile(path_to_zip_file, 'r') as zip_ref:

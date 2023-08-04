@@ -1,6 +1,7 @@
-#### Python Wheel
+# Python Wheel
 
-The wheel adds all dependencies including optional dependencies like 4-bit and flash-attention. To build do:
+## Build
+The wheel adds dependencies including optional dependencies, except flash-attention, wiki-processing, metric, and training. To build do:
 ```bash
 python setup.py sdist bdist_wheel
 ```
@@ -19,3 +20,33 @@ once `whl` file is installed, two new scripts will be added to the current envir
 The wheel is not required to use h2oGPT locally from repo, but makes it portable with all required dependencies.
 
 See [setup.py](../setup.py) for controlling other options via `extras_require`.
+
+## Run
+```python
+from h2ogpt.generate import main
+main()
+```
+See `src/gen.py` for all documented options one can pass to `main()`.  E.g. to start LLaMa7B:
+```python
+from h2ogpt.generate import main
+main(base_model='meta-llama/Llama-2-7b-chat-hf',
+          prompt_type='llama2',
+          save_dir='save_gpt7',
+          score_model=None,
+          max_max_new_tokens=2048,
+          max_new_tokens=1024,
+          num_async=10,
+          top_k_docs=-1)
+```
+
+## Checks
+Once the wheel is built, if you do:
+```bash
+python -m pip check
+```
+you may see:
+```text
+h2ogpt 0.1.0 has requirement numpy==1.24.3, but you have numpy 1.23.5.
+h2ogpt 0.1.0 has requirement pandas==2.0.2, but you have pandas 1.5.3.
+```
+but that is expected.

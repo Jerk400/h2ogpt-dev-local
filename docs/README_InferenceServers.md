@@ -37,7 +37,7 @@ Use `BUILD_EXTENSIONS=False` instead of have GPUs below A100.
 conda create -n textgen -y
 conda activate textgen
 conda install python=3.10 -y
-export CUDA_HOME=/usr/local/cuda-11.8
+export CUDA_HOME=/usr/local/cuda-11.7
 BUILD_EXTENSIONS=True make install # Install repository and HF/transformer fork with CUDA kernels
 cd server && make install install-flash-attention
 ```
@@ -110,12 +110,20 @@ or for Falcon 40B instruct:
 export CUDA_VISIBLE_DEVICES=6,7
 docker run -d --gpus all --shm-size 1g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:latest --model-id tiiuae/falcon-40b-instruct --max-input-length 2048 --max-total-tokens 4096 --max-stop-sequences 6 --sharded true --num-shard 2
 ```
-or for Vicuna33b:
+or for Vicuna33b on 2 GPUs:
 ```bash
 export CUDA_VISIBLE_DEVICES=4,5
 docker run -d --gpus all --shm-size 2g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:latest --model-id lmsys/vicuna-33b-v1.3 --max-input-length 2048 --max-total-tokens 4096 --sharded true --num-shard 2
 ```
-If one changes the port `6112` for each docker run command, any number of inference servers with any models can be added.
+or for LLaMa 70B on 4 A*100 GPUs (using about 40GB each GPU, but sometimes more):
+```bash
+export MODEL=meta-llama/Llama-2-70b-chat-hf
+export GRADIO_SERVER_PORT=7860
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+docker run -d --gpus all --shm-size 1g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:0.9.3 --model-id $MODEL --max-input-length 4096 --max-total-tokens 8192 --max-stop-sequences 6 --sharded true --num-shard 4 &>> logs.infserver.txt
+SAVE_DIR=./save.70b python generate.py --inference_server=http://127.0.0.1:6112 --base_model=$MODEL --height=500 --score_model=None --max_max_new_tokens=4096 --max_new_tokens=512 &>> logs.$MODEL_NAME.gradio_chat.txt
+```
+If one changes the port `6112` or `GRADIO_SERVER_PORT` for each docker/gradio run command, any number of inference servers with any models can be added.
 
 On isolated system, one might want to script start-up, and start with a kill sequence like this if one is using ngrok to map a local system to some domain name:
 ```bash
@@ -164,6 +172,12 @@ SAVE_DIR=./save/ python generate.py --inference_server="http://192.168.1.46:6112
 ```
 One can pass, e.g., `--max_max_new_tokens=2048 --max_new_tokens=512` to generate.py to control tokens, along with `--max-batch-prefill-tokens=2048 --max-input-length 2048 --max-total-tokens 4096 --max-stop-sequences 6 --trust-remote-code` for TGI server to match.
 
+For efficient parallel summarization with 13B LLaMa2 on single A100:
+```bash
+python --inference_server=http://192.168.1.46:6112 --base_model=meta-llama/Llama-2-13b-chat-hf --score_model=None --save_dir=save_gpt13 --max_max_new_tokens=2048 --max_new_tokens=1024 --langchain_mode=LLM --visible_langchain_modes="['LLM', 'UserData', 'MyData']" --captions_model=Salesforce/blip2-flan-t5-xl --num_async=10 --top_k_docs=-1
+```
+which achieves about 80 output tokens/second, using 10 simultaneous streams and all document pages/parts.  In about 2 minutes, it can handle summarization of a complete 30 page ArXiV paper using LangChain map-reduce with asyncio bugs fixed: https://github.com/langchain-ai/langchain/issues/8391 .  In UI or API calls, one should disable streaming since the threading used by streaming does not mix well with asyncio. 
+
 ## Gradio Inference Server-Client
 
 You can use your own server for some model supported by the server's system specs, e.g.:
@@ -178,7 +192,7 @@ python generate.py --inference_server="http://192.168.0.10:7680" --base_model=h2
 One can also use gradio live link like `https://6a8d4035f1c8858731.gradio.live` or some ngrok or other mapping/redirect to `https://` address.
 One must specify the model used at the endpoint so the prompt type is handled.  This assumes that base model is specified in `prompter.py::prompt_type_to_model_name`.  Otherwise, one should pass `--prompt_type` as well, like:
 ```bash
-python generate.py --inference_server="http://192.168.0.10:7680" --base_model=foo_model --prompt_type=wizard2
+python generate.py --inference_server="http://192.168.0.10:7680" --base_model=foo_model --prompt_type=llama2
 ```
 If even `prompt_type` is not listed in `enums.py::PromptType` then one can pass `--prompt_dict` like:
 ```bash
@@ -214,9 +228,9 @@ find openai_vllm -name '*.py' | xargs sed -i 's/from openai\./from openai_vllm./
 find openai_vllm -name '*.py' | xargs sed -i 's/import openai/import openai_vllm/g'
 ```
 
-Assuming torch was installed with CUDA 11.8, and you have installed cuda locally in `/usr/local/cuda-11.8`, then can start in OpenAI compliant mode.  E.g. for LLaMa 65B on 2 GPUs:
+Assuming torch was installed with CUDA 11.7, and you have installed cuda locally in `/usr/local/cuda-11.7`, then can start in OpenAI compliant mode.  E.g. for LLaMa 65B on 2 GPUs:
 ```bash
-CUDA_HOME=/usr/local/cuda-11.8 pip install vllm ray
+CUDA_HOME=/usr/local/cuda-11.7 pip install vllm ray
 export NCCL_IGNORE_DISABLED_P2P=1
 export CUDA_VISIBLE_DEVICESs=0,1
 python -m vllm.entrypoints.openai.api_server --port=5000 --host=0.0.0.0 --model h2oai/h2ogpt-research-oasst1-llama-65b --tokenizer=hf-internal-testing/llama-tokenizer --tensor-parallel-size=2 --seed 1234
@@ -321,6 +335,27 @@ Note: `vllm_chat` ChatCompletion is not supported by vLLM project.
 
 Note vLLM has bug in stopping sequence that is does not return the last token, unlike OpenAI, so a hack is in place for `prompt_type=human_bot`, and other prompts may need similar hacks.  See `fix_text()` in `src/prompter.py`.
 
+## Replicate Inference Server-Client
+
+If you have a Replicate key and set an ENV `REPLICATE_API_TOKEN`, then you can access Replicate models via gradio by running:
+```bash
+pip install replicate
+export REPLICATE_API_TOKEN=<key>
+python generate.py --inference_server="replicate:<replicate model string>" --base_model="<HF model name>"
+```
+where `<key>` should be replaced by your Replicate key, `<replicate model string>` should be replaced by the model name, e.g. `model="a16z-infra/llama13b-v2-chat:df7690f1994d94e96ad9d568eac121aecf50684a0b0963b25a41cc40061269e5`.  Here we used an example for [LLaMa-V2](https://replicate.com/a16z-infra/llama13b-v2-chat), and `<HF model name>` should be replaced by equivalent HuggingFace Model Name (if this is not known or cannot match, then choose whichever HF model has most similar tokenizer.).  The `prompt_type` in h2oGPT is unused except for system prompting if chosen.
+
+For example, for LLaMa-2 7B:
+```bash
+python generate.py --inference_server="replicate:lucataco/llama-2-7b-chat:6ab580ab4eef2c2b440f2441ec0fc0ace5470edaf2cbea50b8550aec0b3fbd38" --base_model="TheBloke/Llama-2-7b-Chat-GPTQ"
+```
+
+Replicate is **not** recommended for private document question-answer, but sufficient when full privacy is not required.  Only chunks of documents will be sent to the LLM for each LLM response.
+
+Issues:
+* `requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0)`
+  * Sometimes Replicate sends back bad json, seems randomly occurs.
+
 ## h2oGPT start-up vs. in-app selection
 
 When using `generate.py`, specifying the `--base_model` or `--inference_server` on the CLI is not required.  One can also add any model and server URL (with optional port) in the **Model** tab at the bottom:
@@ -363,6 +398,13 @@ Note: The client API calls for chat APIs (i.e. `instruction` type for `instructi
 
 ![Models Lock](models_lock.png)
 
+To run a gradio server and talk to it and OpenAI from another generate gradio UI, do:
+```bash
+GRADIO_SERVER_PORT=5000 python generate.py --base_model=h2oai/h2ogpt-gm-oasst1-en-2048-open-llama-13b &
+sleep 60
+python generate.py --model_lock="[{'inference_server':'http://192.168.1.xx:5000','base_model':'h2oai/h2ogpt-gm-oasst1-en-2048-open-llama-13b'},{'inference_server':'openai_chat','base_model':'gpt-3.5-turbo'}]" --model_lock_columns=2
+```
+where be sure to replace `192.168.1.xx` with your IP address.  Note the ampersand so the first call is in background.  The sleep gives time for the first one to come up.  The above is as if ran on single system, but you can run on any other system separate generates of any number.
 
 ### System info from gradio server
 

@@ -1,9 +1,10 @@
+import ast
 import contextlib
 import functools
+import gc
 import hashlib
 import inspect
 import os
-import gc
 import pathlib
 import pickle
 import random
@@ -14,16 +15,46 @@ import threading
 import time
 import traceback
 import zipfile
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
+from typing import Tuple, Callable, Dict
 
 import filelock
-import requests, uuid
-from typing import Tuple, Callable, Dict
-from tqdm.auto import tqdm
-from joblib import Parallel
-from concurrent.futures import ProcessPoolExecutor
+import fire
 import numpy as np
 import pandas as pd
+import requests
+import uuid
+from fire import inspectutils
+from joblib import Parallel
+from tqdm.auto import tqdm
+
+
+def H2O_Fire(component=None):
+    config_prefix = "H2OGPT_"
+
+    args = sys.argv[1:]
+    query_args = [arg.split("=")[0].split(" ")[0].lstrip("-") for arg in args]
+
+    fn_spec = inspectutils.GetFullArgSpec(component)
+    for key, value in os.environ.items():
+        if not (
+                (key.startswith(config_prefix) or key.startswith(config_prefix.lower()))
+                and len(key) > len(config_prefix)
+        ):
+            continue  # ignore as non H2OGPT argument
+
+        new_key = key[len(config_prefix):].lower()
+
+        if new_key in query_args:
+            continue  # ignore as already passed as script argument
+
+        if new_key not in fn_spec.args:
+            continue  # ignore as not a valid H2OGPT argument
+
+        args.append(f"--{new_key}={value}")
+
+    fire.Fire(component=component, command=args)
 
 
 def set_seed(seed: int):
@@ -55,11 +86,14 @@ def flatten_list(lis):
 
 
 def clear_torch_cache():
-    import torch
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            gc.collect()
+    except RuntimeError as e:
+        print("clear_torch_cache error: %s" % ''.join(traceback.format_tb(e.__traceback__)), flush=True)
 
 
 def ping():
@@ -179,8 +213,10 @@ def _zip_data(root_dirs=None, zip_file=None, base_dir='./'):
         host_name = os.getenv('HF_HOSTNAME', 'emptyhost')
         zip_file = "data_%s_%s.zip" % (datetime_str, host_name)
     assert root_dirs is not None
-    if not os.path.isdir(os.path.dirname(zip_file)) and os.path.dirname(zip_file):
-        os.makedirs(os.path.dirname(zip_file), exist_ok=True)
+    base_path = os.path.dirname(zip_file)
+    if not os.path.isdir(base_path) and os.path.dirname(zip_file):
+        base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
+        zip_file = os.path.join(base_path, os.path.basename(zip_file))
     with zipfile.ZipFile(zip_file, "w") as expt_zip:
         for root_dir in root_dirs:
             if root_dir is None:
@@ -196,6 +232,8 @@ def _zip_data(root_dirs=None, zip_file=None, base_dir='./'):
 
 def save_generate_output(prompt=None, output=None, base_model=None, save_dir=None, where_from='unknown where from',
                          extra_dict={}):
+    if not save_dir:
+        return
     try:
         return _save_generate_output(prompt=prompt, output=output, base_model=base_model, save_dir=save_dir,
                                      where_from=where_from, extra_dict=extra_dict)
@@ -213,11 +251,17 @@ def _save_generate_output(prompt=None, output=None, base_model=None, save_dir=No
     """
     prompt = '<not set>' if prompt is None else prompt
     output = '<not set>' if output is None else output
-    assert save_dir, "save_dir must be provided"
     if os.path.exists(save_dir) and not os.path.isdir(save_dir):
         raise RuntimeError("save_dir already exists and is not a directory!")
-    os.makedirs(save_dir, exist_ok=True)
+    makedirs(save_dir, exist_ok=True)  # already should be made, can't change at this point
     import json
+
+    # tokenize at end if need to, so doesn't block generation in multi-generator case
+    if extra_dict.get('ntokens') is None:
+        extra_dict['ntokens'] = FakeTokenizer().num_tokens_from_string(output)
+        # only do below if didn't already compute ntokens, else assume also computed rate
+        extra_dict['tokens_persecond'] = extra_dict['ntokens'] / extra_dict['t_generate']
+
     dict_to_save = dict(prompt=prompt, text=output, time=time.ctime(), base_model=base_model, where_from=where_from)
     dict_to_save.update(extra_dict)
     with filelock.FileLock("save_dir.lock"):
@@ -422,17 +466,47 @@ def remove(path: str):
         pass
 
 
-def makedirs(path, exist_ok=True):
+def makedirs(path, exist_ok=True, tmp_ok=False, use_base=False):
     """
     Avoid some inefficiency in os.makedirs()
     :param path:
     :param exist_ok:
+    :param tmp_ok:  use /tmp if can't write locally
+    :param use_base:
     :return:
     """
+    if path is None:
+        return path
+    # if base path set, make relative to that, unless user_path absolute path
+    if use_base:
+        if os.path.normpath(path) == os.path.normpath(os.path.abspath(path)):
+            pass
+        else:
+            if os.getenv('H2OGPT_BASE_PATH') is not None:
+                base_dir = os.path.normpath(os.getenv('H2OGPT_BASE_PATH'))
+                path = os.path.normpath(path)
+                if not path.startswith(base_dir):
+                    path = os.path.join(os.getenv('H2OGPT_BASE_PATH', ''), path)
+                    path = os.path.normpath(path)
+
     if os.path.isdir(path) and os.path.exists(path):
         assert exist_ok, "Path already exists"
         return path
-    os.makedirs(path, exist_ok=exist_ok)
+    try:
+        os.makedirs(path, exist_ok=exist_ok)
+        return path
+    except FileExistsError:
+        # e.g. soft link
+        return path
+    except PermissionError:
+        if tmp_ok:
+            path0 = path
+            path = os.path.join('/tmp/', path)
+            print("Permission denied to %s, using %s instead" % (path0, path), flush=True)
+            os.makedirs(path, exist_ok=exist_ok)
+            return path
+        else:
+            raise
 
 
 def atomic_move_simple(src, dst):
@@ -463,7 +537,9 @@ def download_simple(url, dest=None, print_func=None):
         )
         raise requests.exceptions.RequestException(msg)
     url_data.raw.decode_content = True
-    makedirs(os.path.dirname(dest), exist_ok=True)
+    base_path = os.path.dirname(dest)
+    base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
+    dest = os.path.join(base_path, os.path.basename(dest))
     uuid_tmp = str(uuid.uuid4())[:6]
     dest_tmp = dest + "_dl_" + uuid_tmp + ".tmp"
     with open(dest_tmp, "wb") as f:
@@ -504,7 +580,9 @@ def download(url, dest=None, dest_path=None):
     url_data.raw.decode_content = True
     dirname = os.path.dirname(dest)
     if dirname != "" and not os.path.isdir(dirname):
-        makedirs(os.path.dirname(dest), exist_ok=True)
+        base_path = os.path.dirname(dest)
+        base_path = makedirs(base_path, exist_ok=True, tmp_ok=True, use_base=True)
+        dest = os.path.join(base_path, os.path.basename(dest))
     uuid_tmp = "dl3_" + str(uuid.uuid4())[:6]
     dest_tmp = dest + "_" + uuid_tmp + ".tmp"
     with open(dest_tmp, 'wb') as f:
@@ -875,7 +953,7 @@ def hash_file(file):
     except BaseException as e:
         print("Cannot hash %s due to %s" % (file, str(e)))
         traceback.print_exc()
-        md5 = None
+        return ''
     return md5.hexdigest()
 
 
@@ -930,7 +1008,7 @@ class FakeTokenizer:
 
     def num_tokens_from_string(self, prompt: str) -> int:
         """Returns the number of tokens in a text string."""
-        num_tokens = len(self.encoding.encode(prompt))
+        num_tokens = len(self.encode(prompt)['input_ids'])
         return num_tokens
 
     def __call__(self, x, *args, **kwargs):
@@ -984,13 +1062,24 @@ except (pkg_resources.DistributionNotFound, AssertionError):
     have_selenium = False
 
 try:
+    assert pkg_resources.get_distribution('pillow') is not None
+    have_pillow = True
+except (pkg_resources.DistributionNotFound, AssertionError):
+    have_pillow = False
+
+try:
     assert pkg_resources.get_distribution('playwright') is not None
     have_playwright = True
 except (pkg_resources.DistributionNotFound, AssertionError):
     have_playwright = False
 
-# disable, hangs too often
-have_playwright = False
+
+only_unstructured_urls = os.environ.get("ONLY_UNSTRUCTURED_URLS", "0") == "1"
+only_selenium = os.environ.get("ONLY_SELENIUM", "0") == "1"
+only_playwright = os.environ.get("ONLY_PLAYWRIGHT", "0") == "1"
+if not only_playwright:
+    # disable, hangs too often
+    have_playwright = False
 
 
 def set_openai(inference_server):
@@ -1013,7 +1102,9 @@ def set_openai(inference_server):
 visible_langchain_modes_file = 'visible_langchain_modes.pkl'
 
 
-def save_collection_names(langchain_modes, visible_langchain_modes, langchain_mode_paths, LangChainMode, db1s):
+def save_collection_names(langchain_modes, visible_langchain_modes, langchain_mode_paths,
+                          LangChainMode, db1s,
+                          in_user_db):
     """
     extra controls if UserData type of MyData type
     """
@@ -1036,21 +1127,22 @@ def save_collection_names(langchain_modes, visible_langchain_modes, langchain_mo
                                  k not in scratch_collection_names and k not in llms}
 
     base_path = 'locks'
-    makedirs(base_path)
+    base_path = makedirs(base_path, tmp_ok=True, use_base=True)
 
-    # user
-    extra = ''
-    file = "%s%s" % (visible_langchain_modes_file, extra)
-    with filelock.FileLock(os.path.join(base_path, "%s.lock" % file)):
-        with open(file, 'wb') as f:
-            pickle.dump((user_langchain_modes, user_visible_langchain_modes, user_langchain_mode_paths), f)
-
-    # scratch
-    extra = user_hash
-    file = "%s%s" % (visible_langchain_modes_file, extra)
-    with filelock.FileLock(os.path.join(base_path, "%s.lock" % file)):
-        with open(file, 'wb') as f:
-            pickle.dump((scratch_langchain_modes, scratch_visible_langchain_modes, scratch_langchain_mode_paths), f)
+    if in_user_db:
+        # user
+        extra = ''
+        file = "%s%s" % (visible_langchain_modes_file, extra)
+        with filelock.FileLock(os.path.join(base_path, "%s.lock" % file)):
+            with open(file, 'wb') as f:
+                pickle.dump((user_langchain_modes, user_visible_langchain_modes, user_langchain_mode_paths), f)
+    else:
+        # scratch
+        extra = user_hash
+        file = "%s%s" % (visible_langchain_modes_file, extra)
+        with filelock.FileLock(os.path.join(base_path, "%s.lock" % file)):
+            with open(file, 'wb') as f:
+                pickle.dump((scratch_langchain_modes, scratch_visible_langchain_modes, scratch_langchain_mode_paths), f)
 
 
 def load_collection_enum(extra):
@@ -1072,9 +1164,36 @@ def load_collection_enum(extra):
     for k, v in langchain_mode_paths_from_file.items():
         if v is not None and not os.path.isdir(v) and isinstance(v, str):
             # assume was deleted, but need to make again to avoid extra code elsewhere
-            makedirs(v)
+            langchain_mode_paths_from_file[k] = makedirs(v, use_base=True)
     return langchain_modes_from_file, visible_langchain_modes_from_file, langchain_mode_paths_from_file
 
 
 def remove_collection_enum():
     remove(visible_langchain_modes_file)
+
+
+def get_list_or_str(x):
+    if isinstance(x, list):
+        return x
+    elif isinstance(x, str):
+        try:
+            x1 = ast.literal_eval(x)
+            assert isinstance(x1, list)
+            return x1
+        except:
+            return x
+    else:
+        return x
+
+
+def deepcopy_by_pickle_object(object):
+    """
+    Faster deepcopy, can only work on things that are picklable.  Naive Deepcopy is more general.
+    Same method as for class Individual
+    :param object:
+    :return:
+    """
+    gc.disable()
+    new_object = pickle.loads(pickle.dumps(object, -1))
+    gc.enable()
+    return new_object

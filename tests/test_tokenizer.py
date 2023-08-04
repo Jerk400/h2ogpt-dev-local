@@ -24,7 +24,8 @@ def regTokenize(text):
 import time
 
 
-@pytest.mark.skipif(not os.getenv('MEASURE'), reason="For checking token length for various methods: MEASURE=1 pytest -s -v tests/test_tokenizer.py")
+@pytest.mark.skipif(not os.getenv('MEASURE'),
+                    reason="For checking token length for various methods: MEASURE=1 pytest -s -v tests/test_tokenizer.py")
 @wrap_test_forked
 def test_tokenizer1():
     prompt = """Here is an example of how to write a Python program to generate the Fibonacci sequence:
@@ -82,6 +83,18 @@ def run_tokenizer1(prompt):
     print("Instruct Embedding", a, time.time() - t0)
 
 
+@wrap_test_forked
+def test_fake_tokenizer():
+    from src.utils import FakeTokenizer
+    t = FakeTokenizer()
+    assert t.num_tokens_from_string('How are you?') == 4
+    assert t.num_tokens_from_string('<|endoftext|>') == 7
+    try:
+        t.encoding.encode('<|endoftext|>')
+        raise RuntimeError("Shouldn't reach here")
+    except ValueError as e:
+        assert "disallowed special token" in str(e)
+
+
 if __name__ == '__main__':
     test_tokenizer1()
-
