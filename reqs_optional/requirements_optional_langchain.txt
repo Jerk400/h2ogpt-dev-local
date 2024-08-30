@@ -1,18 +1,60 @@
+# ensure constrained to requirements.txt version:
+torch==2.2.1; sys_platform != "darwin" and platform_machine != "arm64"
+torch==2.3.1; sys_platform == "darwin" and platform_machine == "arm64"
+
 # optional for chat with PDF
-langchain==0.0.250
-pypdf==3.14.0
+langchain==0.2.6
+langchain_experimental==0.0.62
+langchain-community==0.2.6
+langsmith==0.1.82
+langchain-core==0.2.23
+langchain-text-splitters==0.2.2
+#langchain_huggingface==0.0.3
+
+pypdf>=3.17.1
 # avoid textract, requires old six
 #textract==1.6.5
+pypdfium2>=4.24.0
 
 # for HF embeddings
-sentence_transformers==2.2.2
+sentence_transformers>=3.0.1
+# https://github.com/h2oai/instructor-embedding/tree/h2ogpt
+# pip wheel .
+InstructorEmbedding @ https://h2o-release.s3.amazonaws.com/h2ogpt/InstructorEmbedding-1.0.1-py3-none-any.whl
+# https://github.com/h2oai/sentence-transformers/tree/h2ogpt
+# pip wheel .
+sentence_transformers_old @ https://h2o-release.s3.amazonaws.com/h2ogpt/sentence_transformers_old-2.2.2-py3-none-any.whl
 
 # optional: for OpenAI endpoint or embeddings (requires key)
-openai==0.27.8
-replicate==0.10.0
+replicate>=0.26.0
+anthropic>=0.28.0
+langchain-anthropic>=0.1.15
+together>=1.1.5
+langchain_together==0.1.3
+langchain-openai>=0.1.8
+langchain-google-genai>=1.0.8
+google-generativeai>=0.7.2
+google-ai-generativelanguage>=0.6.6
+# pydantic version conflict
+#mistral_common==1.3.3
+
+llava @ https://h2o-release.s3.amazonaws.com/h2ogpt/llava-1.7.0.dev0-py3-none-any.whl
+
+#langchain_mistralai==0.1.2  # tokenizers<0.16.0, but transformers requires >=0.19
+httpx>=0.25.2
+httpx-sse>=0.3.1
+mistralai>=0.4.0
+# pydantic issue, don't need yet
+#mistral-common==1.0.2
+
+groq>=0.5.0
+langchain-groq>=0.1.5
 
 # local vector db
-chromadb==0.3.25
+chromadb==0.4.23
+
+pydantic-settings>=2.1.0
+
 # server vector db
 #pymilvus==2.2.8
 
@@ -21,27 +63,44 @@ chromadb==0.3.25
 
 # strong support for images
 # Requires on Ubuntu: sudo apt-get install libmagic-dev poppler-utils tesseract-ocr libtesseract-dev libreoffice
-unstructured[local-inference]==0.9.0
+unstructured[local-inference]==0.12.5
+unstructured[all-docs]==0.12.5
+docx2txt==0.8
+python-docx==1.1.0
 #pdf2image==1.16.3
 #pytesseract==0.3.10
-pillow==9.5.0
-posthog==3.0.1
+pillow>=10.2.0
+posthog
 
-pdfminer.six==20221105
+pdfminer.six==20231228
 urllib3
 requests_file
 
 #pdf2image==1.16.3
 #pytesseract==0.3.10
-tabulate==0.9.0
+tabulate>=0.9.0
 # FYI pandoc already part of requirements.txt
 
 # JSONLoader, but makes some trouble for some users
-# jq==1.4.1
+# TRY: apt-get install autoconf libtool
+# unclear what happens on windows/mac for now
+jq>=1.4.1; platform_machine == "x86_64"
 
 # to check licenses
 # Run: pip-licenses|grep -v 'BSD\|Apache\|MIT'
-pip-licenses==4.3.0
+pip-licenses>=4.3.0
 
 # weaviate vector db
-weaviate-client==3.22.1
+# required for httpx for mistralai
+weaviate-client==3.26.2
+
+# vllm==0.2.2
+
+# only gradio>=4
+gradio_pdf>=0.0.7
+
+gradio_tools>=0.0.9
+
+# Qdrant - https://qdrant.tech vector database
+qdrant-client>=1.8.0
+

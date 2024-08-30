@@ -13,7 +13,7 @@ import pytest
 from matplotlib import pyplot as plt
 
 from langchain.docstore.document import Document
-from langchain.document_loaders import MWDumpLoader
+from langchain_community.document_loaders import MWDumpLoader
 
 # path where downloaded wiki files exist, to be processed
 root_path = "/data/jon/h2o-llm"
@@ -339,5 +339,5 @@ def test_do_wiki_full_all():
     # Note get_views as global() function done once is required to avoid very slow processing
     # WARNING: Requires alot of memory to handle, used up to 300GB system RAM at peak
     """
-    python generate.py --langchain_mode='wiki_full' --visible_langchain_modes="['wiki_full', 'UserData', 'MyData', 'github h2oGPT', 'DriverlessAI docs']" &> lc_out.log
+    python generate.py --langchain_mode='wiki_full' --langchain_modes="['wiki_full', 'UserData', 'MyData', 'github h2oGPT', 'DriverlessAI docs']" &> lc_out.log
     """

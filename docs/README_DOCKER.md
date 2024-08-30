@@ -1,89 +1,392 @@
 # Run or Build h2oGPT Docker
 
-## Setup Docker for CPU Inference
+* Install Docker for [Linux](https://docs.docker.com/engine/install/ubuntu/)
+* Install Docker for [Windows](https://docs.docker.com/desktop/install/windows-install/)
+* Install Docker for [MAC](https://docs.docker.com/desktop/install/mac-install/)
 
-No special docker instructions are required, just follow [these instructions](https://docs.docker.com/engine/install/ubuntu/) to get docker setup at all.  Add your user as part of `docker` group, exit shell, login back in, and run:
+## Linux Ubuntu: Setup Docker for CPU Inference
+
+No special docker instructions are required, just follow [these instructions](https://docs.docker.com/engine/install/ubuntu/) to get docker setup at all, i.e.:
+```bash
+sudo apt update
+sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository -y "deb [arch=amd64] https://download.docker.com/linux/ubuntu jammy stable"
+apt-cache policy docker-ce
+sudo apt install -y docker-ce
+sudo systemctl status docker
+```
+replace `focal` (Ubuntu 20) with `jammy` for Ubuntu 22.
+
+Add your user as part of `docker` group:
+```bash
+sudo usermod -aG docker $USER
+```
+exit shell, login back in, and run:
 ```bash
 newgrp docker
 ```
-which avoids having to reboot.  Or just reboot to have docker access.
+which avoids having to reboot.  Or just reboot to have docker access.  If this cannot be done without entering root access, then edit the `/etc/group` and add your user to group `docker`.
 
-## Setup Docker for GPU Inference
+## Linux Ubuntu: Setup Docker for GPU Inference
 
 Ensure docker installed and ready (requires sudo), can skip if system is already capable of running nvidia containers.  Example here is for Ubuntu, see [NVIDIA Containers](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html#docker) for more examples.
 ```bash
-distribution=$(. /etc/os-release;echo $ID$VERSION_ID) \
-    && curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
-    && curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
-        sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-        sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+  && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
+    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
 sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit-base
-sudo apt install nvidia-container-runtime
+sudo apt install -y nvidia-container-runtime
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-If running on A100's, might require [Installing Fabric Manager](INSTALL.md#install-and-run-fabric-manager-if-have-multiple-a100100s) and [Installing GPU Manager](INSTALL.md#install-nvidia-gpu-manager-if-have-multiple-a100h100s).
-
-## Run h2oGPT using Docker
-
-An example of running h2oGPT via docker using AutoGPTQ LLaMa2 7B model is as follows.  First, ensure you have the latest docker image:
+Confirm runs nvidia-smi from within docker without errors:
 ```bash
-docker pull gcr.io/vorvan/h2oai/h2ogpt-runtime:0.1.0
+sudo docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
 ```
 
-All available public h2oGPT docker images can be found in [Google Container Registry](https://console.cloud.google.com/gcr/images/vorvan/global/h2oai/h2ogpt-runtime).
+If running on A100's, might require [Installing Fabric Manager](INSTALL.md#install-and-run-nvidia-fabric-manager-on-systems-with-multiple-a100-or-h100-gpus) and [Installing GPU Manager](INSTALL.md#install-nvidia-gpu-manager-on-systems-with-multiple-a100-or-h100-gpus).
 
-then run:
+## Prebuild Docker for Windows/Linux x86
+
+All available public h2oGPT docker images can be found in [Google Container Registry](https://console.cloud.google.com/gcr/images/vorvan/global/h2oai/h2ogpt-runtime).  These require cuda drivers that handle CUDA 12.1 or higher.
+
+Ensure image is up-to-date by running:
 ```bash
+docker pull gcr.io/vorvan/h2oai/h2ogpt-runtime:0.2.1
+```
+
+## Build Docker
+
+The GCR contains nightly and released images for x86.
+
+### x86
+
+The default docker supports CUDA or CPU for x86, and HF models supported by torch on Metal M1/M2.
+
+### MAC Metal or other architectures
+
+Choose your llama_cpp_python options, by changing `CMAKE_ARGS` to whichever system you have according to [llama_cpp_python backend documentation](https://github.com/abetlen/llama-cpp-python?tab=readme-ov-file#supported-backends).
+
+For example, for Metal M1/M2 support of llama.cpp GGUF files, one should change `CMAKE_ARGS` in [docker_build_script_ubuntu.sh](../docker_build_script_ubuntu.sh) to have:
+```bash
+export CMAKE_ARGS="-DLLAMA_METAL=on"
+```
+and remove `GGML_CUDA=1`, so that the docker image is Metal Compatible for llama.cpp GGUF files.  Otherwise, Torch supports Metal M1/M2 directly without changes.
+
+### Build
+
+To build the docker image after any local changes (to support Metal for GGUF files, etc.):
+```bash
+# build image
+touch build_info.txt
+docker build -t h2ogpt .
+```
+then to run this version of the docker image, just replace `gcr.io/vorvan/h2oai/h2ogpt-runtime:0.2.1` with `h2ogpt:latest` in any docker run commands.
+
+## Linux: Run h2oGPT using Docker
+
+An example running h2oGPT via docker using Zephyr 7B Beta model is:
+```bash
+mkdir -p ~/.cache/huggingface/hub/
+mkdir -p ~/.triton/cache/
+mkdir -p ~/.config/vllm/
+mkdir -p ~/.cache
+mkdir -p ~/save
+mkdir -p ~/user_path
+mkdir -p ~/db_dir_UserData
+mkdir -p ~/users
+mkdir -p ~/db_nonusers
+mkdir -p ~/llamacpp_path
+mkdir -p ~/h2ogpt_auth
+echo '["key1","key2"]' > ~/h2ogpt_auth/h2ogpt_api_keys.json
+export GRADIO_SERVER_PORT=7860
+export OPENAI_SERVER_PORT=5000
 docker run \
        --gpus all \
        --runtime=nvidia \
        --shm-size=2g \
-       -p 7860:7860 \
+       -p $GRADIO_SERVER_PORT:$GRADIO_SERVER_PORT \
+       -p $OPENAI_SERVER_PORT:$OPENAI_SERVER_PORT \
        --rm --init \
-       -v "${HOME}"/.cache:/workspace/.cache \
+       --network host \
+       -v /etc/passwd:/etc/passwd:ro \
+       -v /etc/group:/etc/group:ro \
+       -u `id -u`:`id -g` \
+       -v "${HOME}"/.cache/huggingface/hub/:/workspace/.cache/huggingface/hub \
+       -v "${HOME}"/.config:/workspace/.config/ \
+       -v "${HOME}"/.triton:/workspace/.triton/  \
        -v "${HOME}"/save:/workspace/save \
-       gcr.io/vorvan/h2oai/h2ogpt-runtime:0.1.0 /workspace/generate.py \
-          --base_model=TheBloke/Llama-2-7b-Chat-GPTQ \
-          --load_gptq="gptq_model-4bit-128g" \
+       -v "${HOME}"/user_path:/workspace/user_path \
+       -v "${HOME}"/db_dir_UserData:/workspace/db_dir_UserData \
+       -v "${HOME}"/users:/workspace/users \
+       -v "${HOME}"/db_nonusers:/workspace/db_nonusers \
+       -v "${HOME}"/llamacpp_path:/workspace/llamacpp_path \
+       -v "${HOME}"/h2ogpt_auth:/workspace/h2ogpt_auth \
+       -e GRADIO_SERVER_PORT=$GRADIO_SERVER_PORT \
+       gcr.io/vorvan/h2oai/h2ogpt-runtime:0.2.1 /workspace/generate.py \
+          --base_model=HuggingFaceH4/zephyr-7b-beta \
           --use_safetensors=True \
-          --prompt_type=llama2 \
+          --prompt_type=zephyr \
           --save_dir='/workspace/save/' \
+          --auth_filename='/workspace/h2ogpt_auth/auth.db' \
+          --h2ogpt_api_keys='/workspace/h2ogpt_auth/h2ogpt_api_keys.json' \
+          --auth='/workspace/h2ogpt_auth/h2ogpt_api_keys.json' \
+          --use_gpu_id=False \
+          --user_path=/workspace/user_path \
+          --langchain_mode="LLM" \
+          --langchain_modes="['UserData', 'LLM']" \
           --score_model=None \
           --max_max_new_tokens=2048 \
           --max_new_tokens=1024 \
-          --num_async=10 \
-          --top_k_docs=-1
+          --use_auth_token="${HUGGING_FACE_HUB_TOKEN}" \
+          --openai_port=$OPENAI_SERVER_PORT
 ```
-then go to http://localhost:7860/ or http://127.0.0.1:7860/.
+Use `docker run -d` to run in detached background. Then go to http://localhost:7860/ or http://127.0.0.1:7860/.  For authentication, if use `--auth=/workspace/h2ogpt_auth/auth.json` instead, then do not need to use `--auth_filename`.  For keyed access, change key1 and key2 for `h2ogpt_api_keys` or for open-access remove `--h2ogpt_api_keys` line.
 
-If one needs to use a Hugging Face token to access certain Hugging Face models like Meta version of LLaMa2, can run like:
-```bash
-export HUGGING_FACE_HUB_TOKEN=<hf_...>
-docker run \
-       --gpus all \
-       --runtime=nvidia \
-       --shm-size=2g \
-       -p 7860:7860 \
-       --rm --init \
-       -v "${HOME}"/.cache:/workspace/.cache \
-       -v "${HOME}"/save:/workspace/save \
-       -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN \
-       gcr.io/vorvan/h2oai/h2ogpt-runtime:0.1.0 /workspace/generate.py \
-          --base_model=meta-llama/Llama-2-7b-chat-hf \
-          --prompt_type=llama2 \
-          --save_dir='/workspace/save/' \
-          --score_model=None \
-          --max_max_new_tokens=2048 \
-          --max_new_tokens=1024 \
-          --num_async=10 \
-          --top_k_docs=-1 \
-          --use_auth_token=$HUGGING_FACE_HUB_TOKEN
-```
-for some token `<hf_...>`.  See [Hugging Face User Tokens](https://huggingface.co/docs/hub/security-tokens) for more details.
+If one does not need access to private repo, can remove `--use_auth_token` line, else set env `HUGGING_FACE_HUB_TOKEN` so h2oGPT gets the token.
+
+For single GPU use `--gpus '"device=0"'` or for 2 GPUs use `--gpus '"device=0,1"'` instead of `--gpus all`.
 
 See [README_GPU](README_GPU.md) for more details about what to run.
+
+## Linux: Run h2oGPT in docker offline:
+
+Ensure $HOME/users and $HOME/db_nonusers are writeable by user running docker, then run:
+```bash
+
+export TRANSFORMERS_OFFLINE=1
+export GRADIO_SERVER_PORT=7860
+export OPENAI_SERVER_PORT=5000
+export HF_HUB_OFFLINE=1
+docker run --gpus all \
+--runtime=nvidia \
+--shm-size=2g \
+-e TRANSFORMERS_OFFLINE=$TRANSFORMERS_OFFLINE \
+-e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN \
+-e HF_HUB_OFFLINE=$HF_HUB_OFFLINE \
+-e HF_HOME="/workspace/.cache/huggingface/" \
+-p $GRADIO_SERVER_PORT:$GRADIO_SERVER_PORT \
+-p $OPENAI_SERVER_PORT:$OPENAI_SERVER_PORT \
+--rm --init \
+--network host \
+-v /etc/passwd:/etc/passwd:ro \
+-v /etc/group:/etc/group:ro \
+-u `id -u`:`id -g` \
+-v "${HOME}"/.cache/huggingface/:/workspace/.cache/huggingface \
+-v "${HOME}"/.cache/torch/:/workspace/.cache/torch \
+-v "${HOME}"/.cache/transformers/:/workspace/.cache/transformers \
+-v "${HOME}"/save:/workspace/save \
+-v "${HOME}"/user_path:/workspace/user_path \
+-v "${HOME}"/db_dir_UserData:/workspace/db_dir_UserData \
+-v "${HOME}"/users:/workspace/users \
+-v "${HOME}"/db_nonusers:/workspace/db_nonusers \
+-v "${HOME}"/llamacpp_path:/workspace/llamacpp_path \
+-e GRADIO_SERVER_PORT=$GRADIO_SERVER_PORT \
+ gcr.io/vorvan/h2oai/h2ogpt-runtime:0.2.1 \
+ /workspace/generate.py \
+ --base_model=mistralai/Mistral-7B-Instruct-v0.2 \
+ --use_safetensors=False \
+ --prompt_type=mistral \
+ --save_dir='/workspace/save/' \
+ --use_gpu_id=False \
+ --user_path=/workspace/user_path \
+ --langchain_mode="LLM" \
+ --langchain_modes="['UserData', 'MyData', 'LLM']" \
+ --score_model=None \
+ --max_max_new_tokens=2048 \
+ --max_new_tokens=1024 \
+ --visible_visible_models=False \
+ --openai_port=$OPENAI_SERVER_PORT \
+ --gradio_offline_level=2
+```
+Depending upon if use links, may require more specific mappings to direct location not linked location that cannot be used, e.g.
+```bash
+-v "${HOME}"/.cache/huggingface/hub:/workspace/.cache/huggingface/hub \
+ -v "${HOME}"/.cache:/workspace/.cache \
+```
+You can also specify the cache location:
+```bash
+ -e TRANSFORMERS_CACHE="/workspace/.cache/" \
+ ```
+
+
+## Run h2oGPT +  vLLM or vLLM using Docker
+
+One can run an inference server in one docker and h2oGPT in another docker.
+
+For the vLLM server running on 2 GPUs using h2oai/h2ogpt-4096-llama2-7b-chat model, run:
+```bash
+unset CUDA_VISIBLE_DEVICES
+mkdir -p $HOME/.cache/huggingface/hub
+mkdir -p $HOME/.cache/huggingface/modules/
+mkdir -p $HOME/.triton/cache/
+mkdir -p $HOME/.config/vllm
+docker run \
+    --runtime=nvidia \
+    --gpus '"device=0,1"' \
+    --shm-size=10.24gb \
+    -p 5000:5000 \
+    --rm --init \
+    -e NCCL_IGNORE_DISABLED_P2P=1 \
+    -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN \
+    -e VLLM_NO_USAGE_STATS=1 \
+    -e VLLM_NCCL_SO_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/nccl/lib/libnccl.so.2 \
+    -e DO_NOT_TRACK=1 \
+    -e NUMBA_CACHE_DIR=/tmp/ \
+    -v /etc/passwd:/etc/passwd:ro \
+    -v /etc/group:/etc/group:ro \
+    -u `id -u`:`id -g` \
+    -v "${HOME}"/.cache:$HOME/.cache/ -v "${HOME}"/.config:$HOME/.config/   -v "${HOME}"/.triton:$HOME/.triton/  \
+    --network host \
+    vllm/vllm-openai:latest \
+        --port=5000 \
+        --host=0.0.0.0 \
+        --model=h2oai/h2ogpt-4096-llama2-7b-chat \
+        --tokenizer=hf-internal-testing/llama-tokenizer \
+        --tensor-parallel-size=2 \
+        --seed 1234 \
+        --trust-remote-code \
+        --download-dir=/workspace/.cache/huggingface/hub &>> logs.vllm_server.txt
+```
+Use `docker run -d` to run in detached background.
+
+Checks the logs `logs.vllm_server.txt` to make sure server is running.
+If ones sees similar output to below, then endpoint it up & running.
+```bash
+INFO:     Started server process [7]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:5000 (Press CTRL+C to quit
+```
+
+For LLaMa-2 70B AWQ in docker using vLLM run:
+```bash
+mkdir -p $HOME/.cache/huggingface/hub
+mkdir -p $HOME/.cache/huggingface/modules/
+mkdir -p $HOME/.triton/cache/
+mkdir -p $HOME/.config/vllm
+docker run -d \
+    --runtime=nvidia \
+    --gpus '"device=0,1"' \
+    --shm-size=10.24gb \
+    -p 5000:5000 \
+    -e NCCL_IGNORE_DISABLED_P2P=1 \
+    -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN \
+    -e VLLM_NO_USAGE_STATS=1 \
+    -e VLLM_NCCL_SO_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/nccl/lib/libnccl.so.2 \
+    -e DO_NOT_TRACK=1 \
+    -e NUMBA_CACHE_DIR=/tmp/ \
+    -v /etc/passwd:/etc/passwd:ro \
+    -v /etc/group:/etc/group:ro \
+    -u `id -u`:`id -g` \
+    -v "${HOME}"/.cache:$HOME/.cache/ -v "${HOME}"/.config:$HOME/.config/   -v "${HOME}"/.triton:$HOME/.triton/  \
+    --network host \
+    vllm/vllm-openai:latest \
+        --port=5000 \
+        --host=0.0.0.0 \
+        --model=h2oai/h2ogpt-4096-llama2-70b-chat-4bit \
+        --tensor-parallel-size=2 \
+        --seed 1234 \
+        --trust-remote-code \
+	    --max-num-batched-tokens 8192 \
+	    --quantization awq \
+	    --worker-use-ray \
+	    --enforce-eager \
+        --download-dir=/workspace/.cache/huggingface/hub &>> logs.vllm_server.70b_awq.txt
+```
+for choice of port, IP,  model, some number of GPUs matching tensor-parallel-size, etc.
+We add `--enforce-eager` to avoid excess memory usage by CUDA graphs.
+
+For 4*A10G on AWS using LLaMa-2 70B AWQ run:
+```bash
+mkdir -p $HOME/.cache/huggingface/hub
+mkdir -p $HOME/.cache/huggingface/modules/
+mkdir -p $HOME/.triton/cache/
+mkdir -p $HOME/.config/vllm
+docker run -d \
+    --runtime=nvidia \
+    --gpus '"device=0,1,2,3"' \
+    --shm-size=10.24gb \
+    -p 5000:5000 \
+    -e NCCL_IGNORE_DISABLED_P2P=1 \
+    -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN \
+    -e VLLM_NO_USAGE_STATS=1 \
+    -e VLLM_NCCL_SO_PATH=/usr/local/lib/python3.10/dist-packages/nvidia/nccl/lib/libnccl.so.2 \
+    -e DO_NOT_TRACK=1 \
+    -e NUMBA_CACHE_DIR=/tmp/ \
+    -v /etc/passwd:/etc/passwd:ro \
+    -v /etc/group:/etc/group:ro \
+    -u `id -u`:`id -g` \
+    -v "${HOME}"/.cache:$HOME/.cache/ -v "${HOME}"/.config:$HOME/.config/   -v "${HOME}"/.triton:$HOME/.triton/  \
+    --network host \
+    vllm/vllm-openai:latest \
+        --port=5000 \
+        --host=0.0.0.0 \
+        --model=h2oai/h2ogpt-4096-llama2-70b-chat-4bit \
+        --tensor-parallel-size=4 \
+        --seed 1234 \
+        --trust-remote-code \
+	    --max-num-batched-tokens 8192 \
+	    --max-num-seqs 256 \
+	    --quantization awq \
+	    --worker-use-ray \
+	    --enforce-eager \
+        --download-dir=/workspace/.cache/huggingface/hub &>> logs.vllm_server.70b_awq.txt
+```
+One can lower `--max-num-seqs` and `--max-num-batched-tokens` to reduce memory usage.
+
+### Curl Test
+
+One can also verify the endpoint by running following curl command.
+```bash
+curl http://localhost:5000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+    "model": "h2oai/h2ogpt-4096-llama2-7b-chat",
+    "prompt": "San Francisco is a",
+    "max_tokens": 7,
+    "temperature": 0
+    }'
+```
+If one sees similar output to below, then endpoint it up & running.
+
+```json
+{
+    "id": "cmpl-4b9584f743ff4dc590f0c168f82b063b",
+    "object": "text_completion",
+    "created": 1692796549,
+    "model": "h2oai/h2ogpt-4096-llama2-7b-chat",
+    "choices": [
+        {
+            "index": 0,
+            "text": "city in Northern California that is known",
+            "logprobs": null,
+            "finish_reason": "length"
+        }
+    ],
+    "usage": {
+        "prompt_tokens": 5,
+        "total_tokens": 12,
+        "completion_tokens": 7
+    }
+}
+```
+
+If one needs to only setup vLLM one can stop here.
+
+### Run h2oGPT
+Just add to the above docker run command:
+```bash
+        --inference_server="vllm:0.0.0.0:5000"
+```
+where `--base_model` should match for how ran vLLM and h2oGPT. Make sure to set `--inference_server` argument to the correct vllm endpoint.
+
+When one is done with the docker instance, run `docker ps` and find the container ID's hash, then run `docker stop <hash>`.
+
+Follow [README_InferenceServers.md](README_InferenceServers.md) for more information on how to setup vLLM.
 
 ## Run h2oGPT and TGI using Docker
 
@@ -91,35 +394,27 @@ One can run an inference server in one docker and h2oGPT in another docker.
 
 For the TGI server run (e.g. to run on GPU 0)
 ```bash
-export MODEL=meta-llama/Llama-2-7b-chat-hf
-export HUGGING_FACE_HUB_TOKEN=<hf_...>
-export CUDA_VISIBLE_DEVICES=0
-docker run -d --gpus all \
+export MODEL=h2oai/h2ogpt-4096-llama2-7b-chat
+docker run -d --gpus '"device=0"' \
        --shm-size 1g \
-       -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES \
-       -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN \
-       -e TRANSFORMERS_CACHE="/.cache/" \
+       --network host \
        -p 6112:80 \
-       -v $HOME/.cache:/.cache/ \
        -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:0.9.3 \
        --model-id $MODEL \
        --max-input-length 4096 \
        --max-total-tokens 8192 \
        --max-stop-sequences 6 &>> logs.infserver.txt
 ```
-Each docker can run on any system where network can reach or on same system on different GPUs.  E.g. replace `--gpus all` with `--gpus '"device=0,3"'` to run on GPUs 0 and 3, and note the extra quotes, and then `unset CUDA_VISIBLE_DEVICES` and avoid passing that into the docker image.  This multi-device format is required to avoid TGI server getting confused about which GPUs are available.
+Each docker can run on any system where network can reach or on same system on different GPUs.  E.g. replace `--gpus all` with `--gpus '"device=0,3"'` to run on GPUs 0 and 3, and note the extra quotes.  This multi-device format is required to avoid TGI server getting confused about which GPUs are available.
 
 One a low-memory GPU system can add other options to limit batching, e.g.:
 ```bash
-export MODEL=meta-llama/Llama-2-7b-chat-hf
-export HUGGING_FACE_HUB_TOKEN=<hf_...>
-unset CUDA_VISIBLE_DEVICES
+mkdir -p $HOME/.cache/huggingface/hub/
+mkdir -p $HOME/.cache/huggingface/modules/
+export MODEL=h2oai/h2ogpt-4096-llama2-7b-chat
 docker run -d --gpus '"device=0"' \
         --shm-size 1g \
-        -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN \
-        -e TRANSFORMERS_CACHE="/.cache/" \
         -p 6112:80 \
-        -v $HOME/.cache:/.cache/ \
         -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:0.9.3 \
         --model-id $MODEL \
         --max-input-length 1024 \
@@ -128,48 +423,91 @@ docker run -d --gpus '"device=0"' \
         --max-batch-total-tokens 2048 \
         --max-stop-sequences 6 &>> logs.infserver.txt
 ```
-then wait till it comes up (e.g. check docker logs for detatched container hash in logs.infserver.txt), about 30 seconds for 7B LLaMa2 on 1 GPU.  Then for h2oGPT, just run one of the commands like the above, but add e.g. `--inference_server=192.168.0.1:6112` to the docker command line.  E.g. using same export's as above, run:
-```bash
-export GRADIO_SERVER_PORT=7860
-export CUDA_VISIBLE_DEVICES=0
-docker run -d \
-       --gpus all \
-       --runtime=nvidia \
-       --shm-size=2g \
-       -p $GRADIO_SERVER_PORT:7860 \
-       --rm --init \
-       --network host \
-       -v "${HOME}"/.cache:/workspace/.cache \
-       -v "${HOME}"/save:/workspace/save \
-       -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN \
-       gcr.io/vorvan/h2oai/h2ogpt-runtime:0.1.0 /workspace/generate.py \
-          --base_model=$MODEL \
-          --inference_server=http://localhost:6112 \
-          --prompt_type=llama2 \
-          --save_dir='/workspace/save/' \
-          --score_model=None \
-          --max_max_new_tokens=4096 \
-          --max_new_tokens=1024 \
-          --num_async=10 \
-          --top_k_docs=-1 \
-          --use_auth_token="$HUGGING_FACE_HUB_TOKEN"
-```
-or change `max_max_new_tokens` to `2048` for low-memory case.
 
+Then wait till it comes up (e.g. check docker logs for detached container hash in logs.infserver.txt), about 30 seconds for 7B LLaMa2 on 1 GPU.  Then for h2oGPT, just run one of the commands like the above, but add to the docker run line:
+```bash
+    --inference_server=http://localhost:6112
+````
+Note the h2oGPT container has `--network host` with same port inside and outside so the other container on same host can see it.  Otherwise use actual IP addersses if on separate hosts.
+
+Change `max_max_new_tokens` to `2048` for low-memory case.
+
+For maximal summarization performance when connecting to TGI server, auto-detection of file changes in `--user_path` every query, and maximum document filling of context, add these options:
+```
+          --num_async=10 \
+          --top_k_docs=-1
+          --detect_user_path_changes_every_query=True
+```
 When one is done with the docker instance, run `docker ps` and find the container ID's hash, then run `docker stop <hash>`.
 
 Follow [README_InferenceServers.md](README_InferenceServers.md) for similar (and more) examples of how to launch TGI server using docker.
 
-## Build Docker
+## Make UserData db for generate.py using Docker
 
+To make UserData db for generate.py, put pdfs, etc. into path user_path and run:
 ```bash
-# build auto-gptq
-make docker_build_deps
-# build image
-touch build_info.txt
-docker build -t h2ogpt .
+mkdir -p ~/.cache
+mkdir -p ~/save
+mkdir -p ~/user_path
+mkdir -p ~/db_dir_UserData
+docker run \
+       --gpus all \
+       --runtime=nvidia \
+       --shm-size=2g \
+       --rm --init \
+       --network host \
+       -v /etc/passwd:/etc/passwd:ro \
+       -v /etc/group:/etc/group:ro \
+       -u `id -u`:`id -g` \
+       -v "${HOME}"/.cache:/workspace/.cache \
+       -v "${HOME}"/save:/workspace/save \
+       -v "${HOME}"/user_path:/workspace/user_path \
+       -v "${HOME}"/db_dir_UserData:/workspace/db_dir_UserData \
+       gcr.io/vorvan/h2oai/h2ogpt-runtime:0.2.1 /workspace/src/make_db.py
 ```
-then to run this version of the docker image, just replace `gcr.io/vorvan/h2oai/h2ogpt-runtime:0.1.0` with `h2ogpt:latest` in above run command.
+
+Once db is made, can use in generate.py like:
+```bash
+mkdir -p ~/.cache
+mkdir -p ~/save
+mkdir -p ~/user_path
+mkdir -p ~/db_dir_UserData
+mkdir -p ~/users
+mkdir -p ~/db_nonusers
+mkdir -p ~/llamacpp_path
+docker run \
+       --gpus '"device=0"' \
+       --runtime=nvidia \
+       --shm-size=2g \
+       -p 7860:7860 \
+       --rm --init \
+       --network host \
+       -v /etc/passwd:/etc/passwd:ro \
+       -v /etc/group:/etc/group:ro \
+       -u `id -u`:`id -g` \
+       -v "${HOME}"/.cache:/workspace/.cache \
+       -v "${HOME}"/save:/workspace/save \
+       -v "${HOME}"/user_path:/workspace/user_path \
+       -v "${HOME}"/db_dir_UserData:/workspace/db_dir_UserData \
+       -v "${HOME}"/users:/workspace/users \
+       -v "${HOME}"/db_nonusers:/workspace/db_nonusers \
+       -v "${HOME}"/llamacpp_path:/workspace/llamacpp_path \
+       gcr.io/vorvan/h2oai/h2ogpt-runtime:0.2.1 /workspace/generate.py \
+          --base_model=h2oai/h2ogpt-4096-llama2-7b-chat \
+          --use_safetensors=True \
+          --prompt_type=llama2 \
+          --save_dir='/workspace/save/' \
+          --use_gpu_id=False \
+          --score_model=None \
+          --max_max_new_tokens=2048 \
+          --max_new_tokens=1024 \
+          --langchain_mode=LLM
+```
+
+For a more detailed description of other parameters of the make_db script, checkout the definition in this file: https://github.com/h2oai/h2ogpt/blob/main/src/make_db.py
+
+
+
 
 ## Docker Compose Setup & Inference
 
@@ -194,4 +532,3 @@ then to run this version of the docker image, just replace `gcr.io/vorvan/h2oai/
     ```bash
     docker-compose down --volumes --rmi all
     ```
-

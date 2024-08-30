@@ -1,56 +1,45 @@
 # devel needed for bitsandbytes requirement of libcudart.so, otherwise runtime sufficient
-FROM nvidia/cuda:11.7.1-cudnn8-devel-ubuntu20.04
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu20.04
 
-ARG DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
-    git \
-    curl \
-    wget \
-    software-properties-common \
-    pandoc
+ENV PATH="/h2ogpt_conda/envs/h2ogpt/bin:${PATH}"
+ARG PATH="/h2ogpt_conda/envs/h2ogpt/bin:${PATH}"
 
-ENV PATH="/root/miniconda3/bin:${PATH}"
-ARG PATH="/root/miniconda3/bin:${PATH}"
-
-RUN wget https://repo.anaconda.com/miniconda/Miniconda3-py310_23.1.0-1-Linux-x86_64.sh && \
-    mkdir /root/.conda && \
-    bash ./Miniconda3-py310_23.1.0-1-Linux-x86_64.sh -b && \
-    conda install python=3.10 -c conda-forge -y
+ENV HOME=/workspace
+ENV CUDA_HOME=/usr/local/cuda-12.1
+ENV VLLM_CACHE=/workspace/.vllm_cache
+ENV TIKTOKEN_CACHE_DIR=/workspace/tiktoken_cache
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 WORKDIR /workspace
 
-COPY requirements.txt requirements.txt
-COPY reqs_optional reqs_optional
+COPY . /workspace/
 
-RUN python3.10 -m pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu117
-RUN python3.10 -m pip install -r reqs_optional/requirements_optional_langchain.txt
-RUN python3.10 -m pip install -r reqs_optional/requirements_optional_gpt4all.txt
-RUN python3.10 -m pip install -r reqs_optional/requirements_optional_langchain.gpllike.txt
-RUN python3.10 -m pip install -r reqs_optional/requirements_optional_langchain.urls.txt
+COPY build_info.txt /workspace/
 
-RUN apt-get install -y libmagic-dev poppler-utils tesseract-ocr libtesseract-dev libreoffice
+RUN cd /workspace && ./docker_build_script_ubuntu.sh
 
-RUN python3.10 -m nltk.downloader all
+RUN chmod -R a+rwx /workspace
 
-ENV CUDA_HOME=/usr/local/cuda-11.7
+ARG user=h2ogpt
+ARG group=h2ogpt
+ARG uid=1000
+ARG gid=1000
 
-# Install prebuilt dependencies
+RUN groupadd -g ${gid} ${group} && useradd -u ${uid} -g ${group} -s /bin/bash ${user}
+# already exists in base image
+# RUN groupadd -g ${gid} docker && useradd -u ${uid} -g ${group} -m ${user}
 
-RUN python3.10 -m pip install https://s3.amazonaws.com/artifacts.h2o.ai/deps/h2ogpt/auto_gptq-0.3.0-cp310-cp310-linux_x86_64.whl --use-deprecated=legacy-resolver
-RUN python3.10 -m pip install https://github.com/jllllll/llama-cpp-python-cuBLAS-wheels/releases/download/textgen-webui/llama_cpp_python_cuda-0.1.73+cu117-cp310-cp310-linux_x86_64.whl
-RUN python3.10 -m pip install https://github.com/jllllll/exllama/releases/download/0.0.8/exllama-0.0.8+cu118-cp310-cp310-linux_x86_64.whl --no-cache-dir
+# Add the user to the docker group
+RUN usermod -aG docker ${user}
 
-COPY . .
-
-RUN sp=`python3.10 -c 'import site; print(site.getsitepackages()[0])'` && sed -i 's/posthog\.capture/return\n            posthog.capture/' $sp/chromadb/telemetry/posthog.py
-RUN sed -i 's/# n_gpu_layers=20/n_gpu_layers=20/g' /workspace/.env_gpt4all
+# Switch to the new user
+USER ${user}
 
 EXPOSE 8888
 EXPOSE 7860
-
-ENV TRANSFORMERS_CACHE=/workspace/.cache/huggingface/hub/
-
-COPY build_info.txt /build_info.txt
+EXPOSE 5000
+EXPOSE 5004
 
 ENTRYPOINT ["python3.10"]

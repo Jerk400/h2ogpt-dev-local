@@ -11,9 +11,17 @@ from transformers import PreTrainedModel
 
 
 def do_export():
-    BASE_MODEL = 'tiiuae/falcon-40b'
-    LORA_WEIGHTS = 'falcon-40b.h2oaiopenassistant_oasst1_h2ogpt.1_epochs.894d8450d35c180cd03222a45658d04c15b78d4b.9'
-    OUTPUT_NAME = "h2ogpt-oasst1-2048-falcon-40b"
+    BASE_MODEL = 'h2oai/h2ogpt-4096-llama2-13b-chat'
+    LORA_WEIGHTS = 'Llama-2-13b-chat-hf.h2oaiopenassistant_oasst1_h2ogpt_llama2_chat.1_epochs.b2aed9250804d815c258976c98ce968bacd88389.7'
+    OUTPUT_NAME = "h2ogpt-oasst1-4096-llama2-13b"
+
+    BASE_MODEL = 'meta-llama/Llama-2-7b-chat-hf'
+    LORA_WEIGHTS = 'Llama-2-7b-chat-hf.h2oaiopenassistant_oasst1_h2ogpt_llama2_chat.1_epochs.0c6b906f73b5639fd1d53c74fecbc9cf64f0f225.8'
+    OUTPUT_NAME = "h2ogpt-oasst1-4096-llama2-7b"
+
+    BASE_MODEL = 'meta-llama/Llama-2-70b-chat-hf'
+    LORA_WEIGHTS = 'Llama-2-70b-chat-hf.h2oaiopenassistant_oasst1_h2ogpt_llama2_chat.1_epochs.0c6b906f73b5639fd1d53c74fecbc9cf64f0f225.6'
+    OUTPUT_NAME = "h2ogpt-oasst1-4096-llama2-70b"
 
     base_model = os.getenv('BASE_MODEL')
     output = os.getenv('MODEL')
@@ -27,7 +35,8 @@ def do_export():
     as_pytorch = False  # False -> HF
 
     from loaders import get_loaders
-    model_loader, tokenizer_loader = get_loaders(model_name=BASE_MODEL, reward_type=False, llama_type=llama_type)
+    model_loader, tokenizer_loader, conditional_type = (
+        get_loaders(model_name=BASE_MODEL, reward_type=False, llama_type=llama_type))
 
     tokenizer = tokenizer_loader.from_pretrained(
         BASE_MODEL,
@@ -211,11 +220,13 @@ def do_export():
 def do_copy(OUTPUT_NAME):
     dest_file = os.path.join(OUTPUT_NAME, "h2oai_pipeline.py")
     shutil.copyfile("src/h2oai_pipeline.py", dest_file)
-    os.system("""sed -i 's/from enums.*//g' %s""" % dest_file)
     os.system("""sed -i 's/from stopping.*//g' %s""" % dest_file)
     os.system("""sed -i 's/from prompter.*//g' %s""" % dest_file)
-    os.system("""cat %s|grep -v "from enums import PromptType" >> %s""" % ('src/enums.py', dest_file))
-    os.system("""cat %s|grep -v "from enums import PromptType" >> %s""" % ('src/prompter.py', dest_file))
+    os.system("""sed -i 's/from prompter_utils.*//g' %s""" % dest_file)
+    os.system("""cat %s >> %s""" % ('src/enums.py', dest_file))
+    os.system("""cat %s >> %s""" % ('src/prompter_utils.py', dest_file))
+    os.system("""cat %s >> %s""" % ('src/utils.py', dest_file))
+    os.system("""cat %s|grep -v "from enums import PromptType"|grep -v "from stopping" | grep -v "from prompter_utils" | grep -v "from utils" >> %s""" % ('src/prompter.py', dest_file))
     os.system("""cat %s|grep -v "from enums import PromptType" >> %s""" % ('src/stopping.py', dest_file))
 
 

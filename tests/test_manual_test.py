@@ -6,7 +6,7 @@ pytestmark = pytest.mark.skipif(os.getenv('SKIP_MANUAL_TESTS', None) is not None
 
 
 @wrap_test_forked
-def test_chat_context():
+def test_chat_conversation():
     # on h2oai/h2ogpt-oasst1-512-20b
     instruction = """Rephrase in 5 different ways: “Apple a day keeps the doctor away.”"""
     expected_response = """1. “A apple every day will keep you healthy.”
@@ -94,3 +94,16 @@ def test_add_new_doc():
 @wrap_test_forked
 def test_model_lock():
     raise NotImplementedError("""MANUAL TEST FOR NOW  UI test of model lock""")
+
+
+@wrap_test_forked
+def test_async_gradio():
+    raise NotImplementedError("""MANUAL TEST FOR NOW
+    run test_client_summarization and confirm see multiple _acalls at same time before ends for gpt.h2o.ai
+    """)
+
+@wrap_test_forked
+def test_stt_gradio():
+    raise NotImplementedError("""MANUAL TEST FOR NOW
+    use STT in gradio UI.  Ensure can stop recording and edit and continue with edits preserved, etc.
+    """)

@@ -1,0 +1,292 @@
+nameOverride: ""
+fullnameOverride: ""
+namespaceOverride: ""
+
+h2ogpt:
+  enabled: true
+  stack:
+    # -- Run h2oGPT and vLLM on same pod.
+    enabled: false 
+  replicaCount: 1
+  imagePullSecrets: 
+  image:
+    repository: gcr.io/vorvan/h2oai/h2ogpt-runtime
+    tag: 
+    pullPolicy: IfNotPresent
+  initImage:
+    repository:
+    tag:
+    pullPolicy:
+
+  # extra volumes, for more certs, mount under /etc/ssl/more-certs
+  extraVolumes: []
+  extraVolumeMounts: []
+
+  podAffinity:
+  # -- Set hostname and zone to true for pod affinity rules based on hostname and zone.
+  # hostname:
+  # zone:
+
+  storage:
+    size: 128Gi
+    class: 
+    useEphemeral: true
+  
+  externalLLM:
+    enabled: false
+    secret:
+
+    modelLock:
+
+    openAIAzure:
+      enabled: false
+
+    openAI:
+      enabled: False
+
+    replicate: 
+      enabled: false
+  
+  visionModels:
+    enabled: false
+    # -- Visible vision models, the vision model itslef needs to be set via modeLock or base_model
+    # -- Ex: visibleModels: ['OpenGVLab/InternVL-Chat-V1-5']
+    visibleModels: []
+    rotateAlignResizeImage: false
+
+# -- Example configs to use when not using Model Lock and External LLM
+  # overrideConfig:
+  #   base_model: h2oai/h2ogpt-4096-llama2-7b-chat
+  #   use_safetensors: True
+  #   prompt_type: llama2
+  #   save_dir: /workspace/save/
+  #   use_gpu_id: False
+  #   score_model: None
+  #   max_max_new_tokens: 2048
+  #   max_new_tokens: 1024
+
+  overrideConfig:
+    visible_login_tab: False
+    visible_system_tab: False
+    visible_models_tab: False
+    visible_hosts_tab: False
+    # change below to valid vision model or remove this entry
+    #visible_vision_models: "['OpenGVLab/InternVL-Chat-V1-5']"
+    rotate_align_resize_image: False
+    concurrency_count: 100
+    top_k_docs_max_show: 100
+    num_async: 10
+    # change below to valid directory or remove this entry
+    #save_dir: "/docker_logs"
+    score_model: "None"
+    enable_tts: False
+    enable_stt: False
+    enable_transcriptions: False
+    embedding_gpu_id: "cpu"
+    hf_embedding_model: "fake"
+    openai_server: True
+    share: False
+    enforce_h2ogpt_api_key: True
+    enforce_h2ogpt_ui_key: False
+    # change to something secure for ui access to backend
+    #h2ogpt_api_keys: "['api_key_change_me']"
+    metadata_in_context: ""
+    # change or remove if using model hub
+    #use_auth_token: "hf_xxxxx"
+    # change below to first visible model or remove this entry
+    #visible_models: "['mistralai/Mistral-7B-Instruct-v0.3']"
+    # change so ui or api cannot access without this password
+    #admin_pass: "admin_password_change_me"
+
+  service:
+    type: NodePort
+    webPort: 80
+    gptPort: 8888
+    webServiceAnnotations: {}
+
+  updateStrategy:
+    type: RollingUpdate
+
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 
+    runAsGroup: 
+    fsGroup: 
+
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+      type: RuntimeDefault
+
+  resources:
+  nodeSelector:
+  tolerations:
+
+  env: {}
+
+  podAnnotations: {}
+  podLabels: {}
+  autoscaling: {}
+
+tgi:
+  enabled: false
+  replicaCount: 1
+
+  image:
+    repository: ghcr.io/huggingface/text-generation-inference
+    tag: 0.9.3
+    pullPolicy: IfNotPresent
+
+  podAffinity:
+    # -- Set hostname and zone to true for pod affinity rules based on hostname and zone.
+    # hostname:
+    # zone:
+
+  storage:
+    size: 512Gi
+    class: 
+    useEphemeral: true
+  
+  overrideConfig:
+  hfSecret:
+  containerArgs:
+
+  service:
+    type: ClusterIP
+    port: 8080
+
+  updateStrategy:
+    type: RollingUpdate
+
+  podSecurityContext:
+  securityContext:
+
+  resources:
+  nodeSelector:
+  tolerations:
+
+  env: {}
+
+  podAnnotations: {}
+  podLabels: {}
+  autoscaling: {}
+
+vllm:
+  enabled: false
+  replicaCount: 1
+
+  image:
+    repository: vllm/vllm-openai
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  podAffinity:
+    # -- Set hostname and zone to true for pod affinity rules based on hostname and zone.
+    # hostname:
+    # zone:
+
+  imagePullSecrets:
+
+  storage:
+    size: 512Gi
+    class: 
+    useEphemeral: true
+  
+  overrideConfig:
+
+  containerArgs:
+    - "--model"
+    - h2oai/h2ogpt-4096-llama2-7b-chat
+    - "--tokenizer"
+    - hf-internal-testing/llama-tokenizer
+    - "--tensor-parallel-size"
+    - 2
+    - "--seed"
+    - 1234
+    - "--trust-remote-code"
+
+  service:
+    type: ClusterIP
+    port: 5000
+
+  updateStrategy:
+    type: RollingUpdate
+
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 
+    runAsGroup: 
+    fsGroup: 
+
+  securityContext:
+    runAsNonRoot: true
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+    seccompProfile:
+
+  env:
+    VLLM_NO_USAGE_STATS: "1"
+    DO_NOT_TRACK: "1"
+
+  resources:
+
+  nodeSelector:
+
+  tolerations:
+
+  podAnnotations: {}
+  podLabels: {}
+  autoscaling: {}
+
+lmdeploy:
+  enabled: false
+  replicaCount: 1
+
+  image:
+    repository: gcr.io/vorvan/h2oai/h2oai-h2ogpt-lmdeploy
+    tag:
+    pullPolicy: IfNotPresent
+
+  podAffinity:
+    # -- Set hostname and zone to true for pod affinity rules based on hostname and zone.
+    # hostname:
+    # zone:
+
+  storage:
+    size: 512Gi
+    class:
+    useEphemeral: true
+
+  overrideConfig:
+  hfSecret:
+  containerArgs:
+    - "OpenGVLab/InternVL-Chat-V1-5"
+
+  service:
+    type: ClusterIP
+    port: 23333
+
+  updateStrategy:
+    type: RollingUpdate
+
+  podSecurityContext:
+  securityContext:
+
+  resources:
+  nodeSelector:
+  tolerations:
+
+  env: {}
+
+  podAnnotations: {}
+  podLabels: {}
+  autoscaling: {}
+
+# -- CA certs
+caCertificates: ""

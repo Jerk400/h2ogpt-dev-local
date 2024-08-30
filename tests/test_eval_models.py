@@ -37,6 +37,7 @@ def test_score_eval(base_model):
         base_model=base_model,
         chat=False,
         stream_output=False,
+        eval=True,
         gradio=False,
         eval_prompts_only_num=500,
         eval_as_output=False,
@@ -68,13 +69,13 @@ def test_get_falcons(base_model):
                                       use_fast=False,
                                       padding_side="left",
                                       trust_remote_code=True,
-                                      use_auth_token=True,
+                                      token=True,
                                       )
     assert t is not None
     m = AutoModelForCausalLM.from_pretrained(base_model,
                                              trust_remote_code=True,
                                              torch_dtype=torch.float16,
-                                             use_auth_token=True,
+                                             token=True,
                                              )
     assert m is not None
 

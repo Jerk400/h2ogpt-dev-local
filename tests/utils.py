@@ -6,10 +6,14 @@ from functools import wraps, partial
 
 import pytest
 
+from src.enums import noop_prompt_type
+
 if os.path.dirname('src') not in sys.path:
     sys.path.append('src')
 
-from src.utils import call_subprocess_onetask, makedirs
+os.environ['HARD_ASSERTS'] = "1"
+
+from src.utils import call_subprocess_onetask, makedirs, FakeTokenizer, download_simple, sanitize_filename
 
 
 def get_inf_port():
@@ -78,28 +82,6 @@ def get_sha(value):
     return hashlib.md5(str(value).encode('utf-8')).hexdigest()
 
 
-def sanitize_filename(name):
-    """
-    Sanitize file *base* names.  Also used to generation valid class names.
-    :param name:
-    :return:
-    """
-    bad_chars = ['[', ']', ',', '/', '\\', '\\w', '\\s', '-', '+', '\"', '\'', '>', '<', ' ', '=', ')', '(', ':', '^']
-    for char in bad_chars:
-        name = name.replace(char, "_")
-
-    length = len(name)
-    file_length_limit = 250  # bit smaller than 256 for safety
-    sha_length = 32
-    real_length_limit = file_length_limit - (sha_length + 2)
-    if length > file_length_limit:
-        sha = get_sha(name)
-        half_real_length_limit = max(1, int(real_length_limit / 2))
-        name = name[0:half_real_length_limit] + "_" + sha + "_" + name[length - half_real_length_limit:length]
-
-    return name
-
-
 def get_test_name():
     tn = os.environ['PYTEST_CURRENT_TEST'].split(':')[-1]
     tn = "_".join(tn.split(' ')[:-1])  # skip (call) at end
@@ -124,18 +106,22 @@ def make_user_path_test():
     return user_path
 
 
-def get_llama(llama_type=2):
+def get_llama(llama_type=3):
     from huggingface_hub import hf_hub_download
 
-    # default should match .env_gpt4all
+    # FIXME: Pass into main()
     if llama_type == 1:
         file = 'ggml-model-q4_0_7b.bin'
         dest = 'models/7B/'
-        prompt_type = 'plain'
+        prompt_type = noop_prompt_type
     elif llama_type == 2:
         file = 'WizardLM-7B-uncensored.ggmlv3.q8_0.bin'
         dest = './'
         prompt_type = 'wizard2'
+    elif llama_type == 3:
+        file = download_simple('https://huggingface.co/TheBloke/Llama-2-7b-Chat-GGUF/resolve/main/llama-2-7b-chat.Q6_K.gguf?download=true')
+        dest = './'
+        prompt_type = 'llama2'
     else:
         raise ValueError("unknown llama_type=%s" % llama_type)
 
@@ -148,7 +134,7 @@ def get_llama(llama_type=2):
         out_path = hf_hub_download('h2oai/ggml', file, token=token, repo_type='model')
         # out_path will look like '/home/jon/.cache/huggingface/hub/models--h2oai--ggml/snapshots/57e79c71bb0cee07e3e3ffdea507105cd669fa96/ggml-model-q4_0_7b.bin'
         shutil.copy(out_path, dest)
-    return prompt_type
+    return prompt_type, full_path
 
 
 def kill_weaviate(db_type):
@@ -157,3 +143,75 @@ def kill_weaviate(db_type):
     """
     if db_type == 'weaviate':
         os.system('pkill --signal 9 -f weaviate-embedded/weaviate')
+
+
+def count_tokens_llm(prompt, base_model='h2oai/h2ogpt-oig-oasst1-512-6_9b', tokenizer=None):
+    import time
+    if tokenizer is None:
+        assert base_model is not None
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
+    t0 = time.time()
+    a = len(tokenizer(prompt)['input_ids'])
+    print('llm: ', a, time.time() - t0)
+    return dict(llm=a)
+
+
+def count_tokens(prompt, base_model='h2oai/h2ogpt-oig-oasst1-512-6_9b'):
+    tokenizer = FakeTokenizer()
+    num_tokens = tokenizer.num_tokens_from_string(prompt)
+    print(num_tokens)
+
+    from transformers import AutoTokenizer
+
+    t = AutoTokenizer.from_pretrained("distilgpt2")
+    llm_tokenizer = AutoTokenizer.from_pretrained(base_model)
+
+    from InstructorEmbedding import INSTRUCTOR
+    emb = INSTRUCTOR('BAAI/bge-large-en-v1.5')
+
+    import nltk
+
+
+    def nltkTokenize(text):
+        words = nltk.word_tokenize(text)
+        return words
+
+
+    import re
+
+    WORD = re.compile(r'\w+')
+
+
+    def regTokenize(text):
+        words = WORD.findall(text)
+        return words
+
+    counts = {}
+    import time
+    t0 = time.time()
+    a = len(regTokenize(prompt))
+    print('reg: ', a, time.time() - t0)
+    counts.update(dict(reg=a))
+
+    t0 = time.time()
+    a = len(nltkTokenize(prompt))
+    print('nltk: ', a, time.time() - t0)
+    counts.update(dict(nltk=a))
+
+    t0 = time.time()
+    a = len(t(prompt)['input_ids'])
+    print('tiktoken: ', a, time.time() - t0)
+    counts.update(dict(tiktoken=a))
+
+    t0 = time.time()
+    a = len(llm_tokenizer(prompt)['input_ids'])
+    print('llm: ', a, time.time() - t0)
+    counts.update(dict(llm=a))
+
+    t0 = time.time()
+    a = emb.tokenize([prompt])['input_ids'].shape[1]
+    print('instructor-large: ', a, time.time() - t0)
+    counts.update(dict(instructor=a))
+
+    return counts

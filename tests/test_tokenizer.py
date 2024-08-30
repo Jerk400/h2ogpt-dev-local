@@ -60,7 +60,7 @@ def run_tokenizer1(prompt):
     llm_tokenizer = AutoTokenizer.from_pretrained('h2oai/h2ogpt-oig-oasst1-512-6_9b')
 
     from InstructorEmbedding import INSTRUCTOR
-    emb = INSTRUCTOR('hkunlp/instructor-large')
+    emb = INSTRUCTOR('BAAI/bge-large-en-v1.5')
 
     t0 = time.time()
     a = len(regTokenize(prompt))
@@ -94,6 +94,46 @@ def test_fake_tokenizer():
         raise RuntimeError("Shouldn't reach here")
     except ValueError as e:
         assert "disallowed special token" in str(e)
+
+
+@wrap_test_forked
+def test_tokenizer_base_model1():
+    # test separate tokenizer
+    from tests.test_langchain_units import get_test_model
+    model, tokenizer, base_model, prompt_type = get_test_model(base_model='HuggingFaceH4/zephyr-7b-beta',
+                                                               tokenizer_base_model='amazon/MistralLite',
+                                                               prompt_type='human_bot')
+    assert 'MistralForCausalLM' in str(model)
+    assert 'amazon/MistralLite' in str(tokenizer)
+    assert prompt_type == 'human_bot'
+    print("here")
+
+
+@wrap_test_forked
+def test_tokenizer_base_model2():
+    # separate tokenizer for vllm, so don't have to share full model, just proxy tokenizer
+    # if vllm endpoint, we shouldn't fail at all if have invalid base model
+    from tests.test_langchain_units import get_test_model
+    kwargs = dict(base_model='HuggingFaceH4/zephyr-7b-omega',
+                  tokenizer_base_model='amazon/MistralLite',
+                  prompt_type='human_bot',
+                  inference_server="vllm:localhost:8080",
+                  max_seq_len=4096,
+                  )
+    model, tokenizer, base_model, prompt_type = get_test_model(**kwargs, regenerate_clients=True)
+    assert model == 'vllm:localhost:8080'
+    assert 'amazon/MistralLite' in str(tokenizer)
+    assert prompt_type == 'human_bot'
+    print("here")
+
+    # separate tokenizer for vllm, so don't have to share full model, just proxy tokenizer
+    # if vllm endpoint, we shouldn't fail at all if have invalid base model
+    from tests.test_langchain_units import get_test_model
+    model, tokenizer, base_model, prompt_type = get_test_model(**kwargs, regenerate_clients=False)
+    assert model['base_url'] == 'http://localhost:8080/v1'
+    assert 'amazon/MistralLite' in str(tokenizer)
+    assert prompt_type == 'human_bot'
+    print("here")
 
 
 if __name__ == '__main__':

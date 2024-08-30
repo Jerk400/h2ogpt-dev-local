@@ -10,9 +10,9 @@ if os.path.dirname(os.path.abspath(__file__)) not in sys.path:
 if os.path.dirname('src') not in sys.path:
     sys.path.append('src')
 
-from src.loaders import get_loaders, get_tokenizer
-from src.prompter import generate_prompt, prompt_types, PromptType
-from src.utils import get_githash, copy_code, H2O_Fire
+from loaders import get_loaders, get_tokenizer
+from prompter import generate_prompt, prompt_types, PromptType
+from utils import get_githash, copy_code, H2O_Fire
 import torch
 
 
@@ -31,16 +31,9 @@ def train(
         save_code: bool = False,
         run_id: int = None,
 
-        base_model: str = 'h2oai/h2ogpt-oig-oasst1-512-6_9b',
-        # base_model: str = 'h2oai/h2ogpt-oasst1-512-12b',
-        # base_model: str = 'h2oai/h2ogpt-oasst1-512-20b',
-        # base_model: str = 'EleutherAI/gpt-neox-20b',
-        # base_model: str = 'EleutherAI/pythia-12b-deduped',
-        # base_model: str = 'togethercomputer/GPT-NeoXT-Chat-Base-20B',
-        # base_model: str = 'decapoda-research/llama-7b-hf',
-        # base_model: str = 'decapoda-research/llama-13b-hf',
-        # base_model: str = 'decapoda-research/llama-30b-hf',
-        # base_model: str = 'EleutherAI/gpt-j-6B',
+        base_model: str = 'h2oai/h2ogpt-4096-llama2-7b',
+        # base_model: str = 'h2oai/h2ogpt-4096-llama2-13b',
+        # base_model: str = 'h2oai/h2ogpt-4096-llama2-70b',
 
         # only needed if base_model is self-exported HF state without tokenizer
         tokenizer_base_model: str = None,
@@ -69,6 +62,7 @@ def train(
         batch_size: int = 128,
         micro_batch_size: int = 4,
         gradient_checkpointing=False,  # unnecessary with gradient accumulation enabled
+        bf16=False,  # needed (and automatically enabled) for llama2-7b
         fp16=True,
         train_8bit=False,
         train_4bit=False,
@@ -111,8 +105,11 @@ def train(
 ):
     if llama_flash_attn:
         # Need to call this before importing transformers.
-        from src.llama_flash_attn_monkey_patch import replace_llama_attn_with_flash_attn
+        from llama_flash_attn_monkey_patch import replace_llama_attn_with_flash_attn
         replace_llama_attn_with_flash_attn()
+    if "llama2-7b" in base_model:
+        fp16 = False
+        bf16 = True
 
     # allow set token directly
     use_auth_token = os.environ.get("HUGGING_FACE_HUB_TOKEN", use_auth_token)
@@ -148,11 +145,11 @@ def train(
     if llama_type is None:
         llama_type = "llama" in base_model.lower()
     if llama_type and llama_flash_attn:
-        import pkg_resources
+        from importlib.metadata import distribution, PackageNotFoundError
         try:
-            pkg_resources.get_distribution('flash_attn')
+            distribution('flash_attn')
             can_do_flash_attn = True
-        except (pkg_resources.DistributionNotFound, pkg_resources.ContextualVersionConflict):
+        except (PackageNotFoundError, AssertionError):
             can_do_flash_attn = False
 
         if not can_do_flash_attn:
@@ -168,7 +165,7 @@ def train(
 
     device_map = "auto"
 
-    locals_dict = locals()
+    locals_dict = locals().copy()
     locals_print = '\n'.join(['%s: %s' % (k, v) for k, v in locals_dict.items()])
     log(f"Training model with params:\n{locals_print}")
     log("Command: %s\nHash: %s" % (str(' '.join(sys.argv)), get_githash()))
@@ -187,7 +184,8 @@ def train(
             log("num_gpus: %d" % gpus)
             log("max mem: %s" % max_memory)
 
-    model_loader, tokenizer_loader = get_loaders(model_name=base_model, reward_type=False, llama_type=llama_type)
+    model_loader, tokenizer_loader, conditional_type = (
+        get_loaders(model_name=base_model, reward_type=False, llama_type=llama_type))
 
     model = model_loader(
         base_model,
@@ -199,8 +197,9 @@ def train(
         local_files_only=local_files_only,
         trust_remote_code=True,
         resume_download=resume_download,
-        use_auth_token=use_auth_token,
+        token=use_auth_token,
     )
+    print(model)
     if gpus > 1:
         if not ddp:
             log("model parallel")
@@ -235,7 +234,7 @@ def train(
             device_map=device_map,
             local_files_only=local_files_only,
             resume_download=resume_download,
-            use_auth_token=use_auth_token,
+            token=use_auth_token,
         )
     elif lora_r > 0:
         if lora_target_modules is None:
@@ -535,6 +534,7 @@ def train(
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
             gradient_checkpointing=gradient_checkpointing,
+            bf16=bf16,
             fp16=fp16,
             # cosnider 8-bit adam: https://huggingface.co/docs/transformers/v4.18.0/en/performance#8bit-adam
             optim="adamw_torch",  # consider "adafactor" to save memory
@@ -549,8 +549,7 @@ def train(
             load_best_model_at_end=True if val_set_size > 0 else False,
             ddp_find_unused_parameters=False if ddp else None,
             group_by_length=group_by_length,
-            # fsdp="shard_grad_op auto_wrap" if gpus > 1 and not ddp else None,
-            # fsdp_min_num_params=20000 if gpus > 1 and not ddp else None,
+            # fsdp=gpus > 1 and not ddp,
             report_to='tensorboard' if not neptune_run else 'neptune',
         ),
         data_collator=transformers.DataCollatorForSeq2Seq(
@@ -619,10 +618,10 @@ def generate_and_tokenize_prompt(data_point, prompt_type=None, train_on_inputs=F
     assert tokenizer is not None
     prompt_dict = ''  # only for custom prompt_type
     assert prompt_type != PromptType.custom.name, "custom not setup for finetune"
-    full_prompt, _, _, _, _ = generate_prompt(data_point, prompt_type, prompt_dict, False, False, False)
+    full_prompt, _, _, _, _ = generate_prompt(data_point, prompt_type, prompt_dict, False, False)
     tokenized_full_prompt = tokenize(full_prompt, tokenizer, cutoff_len, add_eos_token=add_eos_token)
     if not train_on_inputs:
-        user_prompt, _, _, _, _ = generate_prompt({**data_point, "output": ""}, prompt_type, prompt_dict, False, False,
+        user_prompt, _, _, _, _ = generate_prompt({**data_point, "output": ""}, prompt_type, prompt_dict, False,
                                                   False)
         tokenized_user_prompt = tokenize(user_prompt, tokenizer, cutoff_len, add_eos_token=add_eos_token)
         user_prompt_len = len(tokenized_user_prompt["input_ids"])

@@ -1,6 +1,30 @@
 # Inference Servers
 
-One can connect to Hugging Face text generation inference server, gradio servers running h2oGPT, or OpenAI servers.  
+One can connect to Hugging Face text generation inference server, gradio servers running h2oGPT, OpenAI, or Azure OpenAI servers.  
+
+## oLLaMa
+
+Use as inference server as:
+```bash
+ollama run llama2
+```
+and in another terminal run:
+```bash
+python generate.py --base_model=llama2 --inference_server=vllm_chat:http://localhost:11434/v1/ --prompt_type=openai_chat --max_seq_len=4096
+```
+or if you prefer to load from UI one can run:
+```bash
+python generate.py
+```
+then when h2oGPT UI is up, go to Models Tab and enter `llama2` into base model and enter `vllm_chat:http://localhost:11434/v1/` for server and ensure prompt_type is `plain` and click on right side panel and open context length and set `max_seq_len` to `4096.
+
+![ollama_setup.png](ollama_setup.png)
+
+![ollama_max_seq_len.png](ollama_max_seq_len.png)
+
+Then use as normal in UI:
+
+![ollama_use.png](ollama_use.png)
 
 ## Hugging Face Text Generation Inference Server-Client
 
@@ -81,46 +105,39 @@ newgrp docker
 ```
 in order to log in to this user.
 
-Then for falcon 7b run:
+Then for falcon 7b run on GPU 0:
 ```bash
-export CUDA_VISIBLE_DEVICES=0
-docker run --gpus device=0 --shm-size 2g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data  ghcr.io/huggingface/text-generation-inference:latest --model-id h2oai/h2ogpt-gm-oasst1-en-2048-falcon-7b-v2 --max-input-length 2048 --max-total-tokens 4096 --sharded=false --disable-custom-kernels --trust-remote-code --max-stop-sequences=6
+docker run --gpus device=0 --shm-size 2g -p 6112:80 -v $HOME/.cache/huggingface/hub/:/data  ghcr.io/huggingface/text-generation-inference:latest --model-id h2oai/h2ogpt-gm-oasst1-en-2048-falcon-7b-v2 --max-input-length 2048 --max-total-tokens 4096 --sharded=false --disable-custom-kernels --trust-remote-code --max-stop-sequences=6
 ```
-or Pythia 12b:
+or Pythia 12b on all GPUs:
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-docker run --gpus all --shm-size 2g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data  ghcr.io/huggingface/text-generation-inference:latest --model-id h2oai/h2ogpt-oasst1-512-12b --max-input-length 2048 --max-total-tokens 4096 --sharded=true --num-shard=4 --disable-custom-kernels --trust-remote-code --max-stop-sequences=6
+docker run --gpus all --shm-size 2g -p 6112:80 -v $HOME/.cache/huggingface/hub/:/data  ghcr.io/huggingface/text-generation-inference:latest --model-id h2oai/h2ogpt-oasst1-512-12b --max-input-length 2048 --max-total-tokens 4096 --sharded=true --num-shard=4 --disable-custom-kernels --trust-remote-code --max-stop-sequences=6
 ```
 or for 20B NeoX on 4 GPUs:
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-docker run --gpus all --shm-size 2g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data  ghcr.io/huggingface/text-generation-inference:latest --model-id h2oai/h2ogpt-oasst1-512-20b --max-input-length 2048 --max-total-tokens 4096 --sharded=true --num-shard=4 --disable-custom-kernels --trust-remote-code --max-stop-sequences=6
+docker run --gpus '"device=0,1,2,3"' --shm-size 2g -p 6112:80 -v $HOME/.cache/huggingface/hub/:/data  ghcr.io/huggingface/text-generation-inference:latest --model-id h2oai/h2ogpt-oasst1-512-20b --max-input-length 2048 --max-total-tokens 4096 --sharded=true --num-shard=4 --disable-custom-kernels --trust-remote-code --max-stop-sequences=6
 ```
 or for Falcon 40B on 2 GPUs and some HF token `$HUGGING_FACE_HUB_TOKEN`:
 ```bash
-export CUDA_VISIBLE_DEVICES=1,2
-sudo docker run --gpus all --shm-size 1g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:latest --model-id h2oai/h2ogpt-gm-oasst1-en-2048-falcon-40b-v2 --max-input-length 2048 --max-total-tokens 4096 --max-stop-sequences 6 --sharded true --num-shard 2
+sudo docker run --gpus '"device=0,1"' --shm-size 1g -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN -p 6112:80 -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:latest --model-id h2oai/h2ogpt-gm-oasst1-en-2048-falcon-40b-v2 --max-input-length 2048 --max-total-tokens 4096 --max-stop-sequences 6 --sharded true --num-shard 2
 ```
 Or for MosaicML Chat 30b (careful with docker GPU and TGI version, and one can increase the token counts since has 8k input context):
 ```bash
-docker run -d --gpus '"device=0,3"' --shm-size 2g -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:0.9.1 --model-id mosaicml/mpt-30b-chat --max-batch-prefill-tokens=2048 --max-input-length 2048 --max-total-tokens 4096 --max-stop-sequences 6 --trust-remote-code
+docker run -d --gpus '"device=0,1"' --shm-size 2g -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN -p 6112:80 -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:0.9.1 --model-id mosaicml/mpt-30b-chat --max-batch-prefill-tokens=2048 --max-input-length 2048 --max-total-tokens 4096 --max-stop-sequences 6 --trust-remote-code
 ```
 or for Falcon 40B instruct:
 ```bash
-export CUDA_VISIBLE_DEVICES=6,7
-docker run -d --gpus all --shm-size 1g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:latest --model-id tiiuae/falcon-40b-instruct --max-input-length 2048 --max-total-tokens 4096 --max-stop-sequences 6 --sharded true --num-shard 2
+docker run -d --gpus '"device=0,1"' --shm-size 1g -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN -p 6112:80 -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:latest --model-id tiiuae/falcon-40b-instruct --max-input-length 2048 --max-total-tokens 4096 --max-stop-sequences 6 --sharded true --num-shard 2
 ```
 or for Vicuna33b on 2 GPUs:
 ```bash
-export CUDA_VISIBLE_DEVICES=4,5
-docker run -d --gpus all --shm-size 2g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:latest --model-id lmsys/vicuna-33b-v1.3 --max-input-length 2048 --max-total-tokens 4096 --sharded true --num-shard 2
+docker run -d --gpus '"device=0,1"' --shm-size 2g -p 6112:80 -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:latest --model-id lmsys/vicuna-33b-v1.3 --max-input-length 2048 --max-total-tokens 4096 --sharded true --num-shard 2
 ```
 or for LLaMa 70B on 4 A*100 GPUs (using about 40GB each GPU, but sometimes more):
 ```bash
 export MODEL=meta-llama/Llama-2-70b-chat-hf
 export GRADIO_SERVER_PORT=7860
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-docker run -d --gpus all --shm-size 1g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:0.9.3 --model-id $MODEL --max-input-length 4096 --max-total-tokens 8192 --max-stop-sequences 6 --sharded true --num-shard 4 &>> logs.infserver.txt
+docker run -d --gpus '"device=0,1,2,3"' --shm-size 1g -e HUGGING_FACE_HUB_TOKEN=$HUGGING_FACE_HUB_TOKEN -p 6112:80 -v $HOME/.cache/huggingface/hub/:/data ghcr.io/huggingface/text-generation-inference:0.9.3 --model-id $MODEL --max-input-length 4096 --max-total-tokens 8192 --max-stop-sequences 6 --sharded true --num-shard 4 &>> logs.infserver.txt
 SAVE_DIR=./save.70b python generate.py --inference_server=http://127.0.0.1:6112 --base_model=$MODEL --height=500 --score_model=None --max_max_new_tokens=4096 --max_new_tokens=512 &>> logs.$MODEL_NAME.gradio_chat.txt
 ```
 If one changes the port `6112` or `GRADIO_SERVER_PORT` for each docker/gradio run command, any number of inference servers with any models can be added.
@@ -163,8 +180,7 @@ curl 127.0.0.1:6112/generate     -X POST     -d '{"inputs":"<|prompt|>What is De
 
 For example, server at IP `192.168.1.46` on docker for 4 GPU system running 12B model sharded across all 4 GPUs:
 ```bash
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-docker run --gpus all --shm-size 2g -e CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES -e TRANSFORMERS_CACHE="/.cache/" -p 6112:80 -v $HOME/.cache:/.cache/ -v $HOME/.cache/huggingface/hub/:/data  ghcr.io/huggingface/text-generation-inference:latest --model-id h2oai/h2ogpt-oasst1-512-12b --max-input-length 2048 --max-total-tokens 4096 --sharded=true --num-shard=4 --disable-custom-kernels --trust-remote-code --max-stop-sequences=6
+docker run --gpus '"device=0,1,2,3"' --shm-size 2g -e -p 6112:80 -v $HOME/.cache/huggingface/hub/:/data  ghcr.io/huggingface/text-generation-inference:latest --model-id h2oai/h2ogpt-oasst1-512-12b --max-input-length 2048 --max-total-tokens 4096 --sharded=true --num-shard=4 --disable-custom-kernels --trust-remote-code --max-stop-sequences=6
 ```
 then generate in h2oGPT environment:
 ```bash
@@ -174,7 +190,7 @@ One can pass, e.g., `--max_max_new_tokens=2048 --max_new_tokens=512` to generate
 
 For efficient parallel summarization with 13B LLaMa2 on single A100:
 ```bash
-python --inference_server=http://192.168.1.46:6112 --base_model=meta-llama/Llama-2-13b-chat-hf --score_model=None --save_dir=save_gpt13 --max_max_new_tokens=2048 --max_new_tokens=1024 --langchain_mode=LLM --visible_langchain_modes="['LLM', 'UserData', 'MyData']" --captions_model=Salesforce/blip2-flan-t5-xl --num_async=10 --top_k_docs=-1
+python --inference_server=http://192.168.1.46:6112 --base_model=h2oai/h2ogpt-4096-llama2-13b-chat --score_model=None --save_dir=save_gpt13 --max_max_new_tokens=2048 --max_new_tokens=1024 --langchain_mode=LLM --langchain_modes="['LLM', 'UserData', 'MyData']" --captions_model=microsoft/Florence-2-large --num_async=10 --top_k_docs=-1
 ```
 which achieves about 80 output tokens/second, using 10 simultaneous streams and all document pages/parts.  In about 2 minutes, it can handle summarization of a complete 30 page ArXiV paper using LangChain map-reduce with asyncio bugs fixed: https://github.com/langchain-ai/langchain/issues/8391 .  In UI or API calls, one should disable streaming since the threading used by streaming does not mix well with asyncio. 
 
@@ -200,6 +216,48 @@ python generate.py --inference_server="http://192.168.0.10:7680" --base_model=fo
 ```
 which is just an example for the `human_bot` prompt type.
 
+## OpenAI Proxy Inference Server-Client
+
+Run with `--openai_server=True` (default) to run OpenAI Proxy Server to connect to h2oGPT server via openai python package.  E.g. the LLM can be on a remote inference server:
+```bash
+CUDA_VISIBLE_DEVICES=0 python generate.py --verbose=True --score_model=None --pre_load_embedding_model=False --gradio_offline_level=2 --base_model=openchat/openchat-3.5-1210 --inference_server=vllm:<ip>:<port> --max_seq_len=4096 --save_dir=duder1 --verbose --openai_server=True --concurrency_count=64
+````
+for some `<ip>` and `<port>`.  Or the model can be local torch/llama.cpp/GPT4All model (then set `--concurrency_count=1 to avoid multi-threading issues).
+
+Then as client, h2oGPT currently supports `.chat.completions` and `.completions` for streaming and non-streaming, as well as `.models.retrieve()` and `.models.list()`.  See tests [test_openai_server.py](../openai_server/test_openai_server.py) for Python API examples.
+
+Curl also works like one would do for OpenAI endpoint.
+
+In both Python API and curl case, one should use a `base_url` the same as chosen for the API, e.g. `http://localhost:5000/v1`.
+
+This mode is disabled when `--auth=closed` or `--allow_api=False`, because gradio 3 does not support API calls.
+
+However, keyed access still works, e.g.
+```bash
+python generate.py --score_model=None --base_model=openchat/openchat-3.5-1210 --h2ogpt_api_keys=h2ogpt_api_keys.json --auth_filename=auth.json --enforce_h2ogpt_api_key=True --enforce_h2ogpt_ui_key=True --add_disk_models_to_ui=False
+```
+and OpenAI server can still communicate via Gradio API to Gradio server via the first key.  In addition, the OpenAI server will be keyed with the same key unless otherwise set using env `H2OGPT_OPENAI_API_KEY`, in which case the OpenAI key and h2oGPT key can be different.
+
+For completeness, an example is as follows for non-streaming chat case is as follows:
+```python
+import os
+from openai import OpenAI
+base_url = 'http://<IP>:5000/v1'
+client_args = dict(base_url=base_url, api_key='<API_KEY>')
+openai_client = OpenAI(**client_args)
+
+messages = [{'role': 'user', 'content': 'Who are you?'}]
+client_kwargs = dict(model='h2oai/h2ogpt-4096-llama2-70b-chat', max_tokens=200, stream=False, messages=messages)
+client = openai_client.chat.completions
+
+responses = client.create(**client_kwargs)
+text = responses.choices[0].message.content
+print(text)
+```
+for some IP `<IP>`, which could be the local IP and some key `<API_KEY>`. If OpenAI server was run from h2oGPT using `--openai_server=True` (default), then `api_key` is from ENV `H2OGPT_OPENAI_API_KEY` on same host as Gradio server OpenAI.  If ENV `H2OGPT_OPENAI_API_KEY` is not defined, then h2oGPT will use the first key in the `h2ogpt_api_keys` (file or CLI list) as the OpenAI API key.  If no key is at all set, the OpenAI server is "open" with key `EMPTY` as long as `--allow_api=True`.  If h2oGPT was started with `--model_lock` with multiple inference servers, use `model` to choose which model to select, like done with `--visible_models` from h2oGPT CLI.
+
+**Note:** The default OpenAI proxy port for MacOS is set to `5001`, since ports 5000 and 7000 are being used by [AirPlay in MacOS](https://developer.apple.com/forums/thread/682332).
+
 ## OpenAI Inference Server-Client
 
 If you have an OpenAI key and set an ENV `OPENAI_API_KEY`, then you can access OpenAI models via gradio by running:
@@ -207,6 +265,14 @@ If you have an OpenAI key and set an ENV `OPENAI_API_KEY`, then you can access O
 OPENAI_API_KEY=<key> python generate.py --inference_server="openai_chat" --base_model=gpt-3.5-turbo --h2ocolors=False --langchain_mode=UserData
 ```
 where `<key>` should be replaced by your OpenAI key that probably starts with `sk-`.  OpenAI is **not** recommended for private document question-answer, but it can be a good reference for testing purposes or when privacy is not required.
+
+## Azure OpenAI Inference Server-Client
+
+If you have an Azure OpenAI subscription with OpenAI key and set an ENV `OPENAI_API_KEY`, then you can access Azure OpenAI models via gradio by running:
+```bash
+OPENAI_API_KEY=<key> python generate.py --inference_server="openai_azure_chat:<deployment_name>:<base_url>:<api_version>" --base_model=gpt-3.5-turbo --h2ocolors=False --langchain_mode=UserData
+```
+where `<key>` should be replaced by your OpenAI key that probably starts with `sk-`.  OpenAI is **not** recommended for private document question-answer, but it can be a good reference for testing purposes or when privacy is not required.  The entry `<deployment_name>` is required for Azure, others are optional and can be filled with None or have empty input between `:`.
 
 ## vLLM Inference Server-Client
 
@@ -216,26 +282,48 @@ conda create -n vllm -y
 conda activate vllm
 conda install python=3.10 -y
 ```
-then ensure openai global key/base are not changed in race if used together:
+Install required NCCL:
 ```bash
-cd $HOME/miniconda3/envs/h2ogpt/lib/python3.10/site-packages/
-rm -rf openai_vllm*
-cp -a openai openai_vllm
-cp -a openai-0.27.8.dist-info openai_vllm-0.27.8.dist-info
-find openai_vllm -name '*.py' | xargs sed -i 's/from openai /from openai_vllm /g'
-find openai_vllm -name '*.py' | xargs sed -i 's/openai\./openai_vllm./g'
-find openai_vllm -name '*.py' | xargs sed -i 's/from openai\./from openai_vllm./g'
-find openai_vllm -name '*.py' | xargs sed -i 's/import openai/import openai_vllm/g'
+sudo apt update
+sudo apt install libnccl2 libnccl-dev
 ```
-
-Assuming torch was installed with CUDA 11.7, and you have installed cuda locally in `/usr/local/cuda-11.7`, then can start in OpenAI compliant mode.  E.g. for LLaMa 65B on 2 GPUs:
+Ensure cuda 12.1 installed, and can choose to avoid overwriting original link if want.  E.g. for Ubuntu:
 ```bash
-CUDA_HOME=/usr/local/cuda-11.7 pip install vllm ray
+# https://developer.nvidia.com/cuda-12-1-0-download-archive?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=runfile_local
+ wget https://developer.download.nvidia.com/compute/cuda/12.1.0/local_installers/cuda_12.1.0_530.30.02_linux.run
+sudo sh cuda_12.1.0_530.30.02_linux.run
+sudo chmod -R a+rwx /usr/local/
+```
+Assuming torch was installed with CUDA 12.1, and you have installed cuda locally in `/usr/local/cuda-12.1`:
+```bash
+export CUDA_HOME=/usr/local/cuda-12.1
+export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cu121"
+export HF_HUB_ENABLE_HF_TRANSFER=1
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$HOME/lib64:$HOME/extras/CUPTI/lib64
+export PATH=$PATH:$CUDA_HOME/bin
+pip install vllm
+```
+Then can start in OpenAI compliant mode, e.g. for LLaMa 65B on 2*A100 GPUs:
+```
 export NCCL_IGNORE_DISABLED_P2P=1
 export CUDA_VISIBLE_DEVICESs=0,1
-python -m vllm.entrypoints.openai.api_server --port=5000 --host=0.0.0.0 --model h2oai/h2ogpt-research-oasst1-llama-65b --tokenizer=hf-internal-testing/llama-tokenizer --tensor-parallel-size=2 --seed 1234
+python -m vllm.entrypoints.openai.api_server --port=5000 --host=0.0.0.0 --model h2oai/h2ogpt-research-oasst1-llama-65b --tokenizer=hf-internal-testing/llama-tokenizer --tensor-parallel-size=2 --seed 1234 --max-num-batched-tokens=2048
 ```
-which takes about 3 minutes until Uvicorn starts entirely so endpoint is fully ready, when one sees:
+or for LLaMa-2 70b on 4 GPUs:
+```bash
+export NCCL_IGNORE_DISABLED_P2P=1
+export CUDA_VISIBLE_DEVICESs=0,1,2,3
+python -m vllm.entrypoints.openai.api_server --port=5000 --host=0.0.0.0 --model h2oai/h2ogpt-4096-llama2-70b-chat --tokenizer=hf-internal-testing/llama-tokenizer --tensor-parallel-size=4 --seed 1234 --max-num-batched-tokens=8192
+```
+
+For Mixtral 8*7B need newer cuda 12 toolkit and vllm build, then run:
+```bash
+export CUDA_VISIBLE_DEVICES=0,1
+python -m vllm.entrypoints.openai.api_server --port=5002 --host=0.0.0.0 --model mistralai/Mixtral-8x7B-Instruct-v0.1 --seed 1234 --max-num-batched-tokens=65536 --tensor-parallel-size=2
+```
+Once vLLM etc. have Mixtral support built-in, these special package installs may not be required.  It appears Mixtral does not run on single 80GB board in FP16 with default max sequence length.  CUDA 11.8 is also allowed, 12.x just has minor improvements.
+
+The startup may take few minutes until Uvicorn starts entirely so endpoint is fully ready, when one sees:
 ```text
 INFO 07-15 02:56:41 llm_engine.py:131] # GPU blocks: 496, # CPU blocks: 204
 INFO 07-15 02:56:43 tokenizer.py:28] For some LLaMA-based models, initializing the fast tokenizer may take a long time. To eliminate the initialization time, consider using 'hf-internal-testing/llama-tokenizer' instead of the original tokenizer.
@@ -262,10 +350,11 @@ output = llm.generate("San Franciso is a")
 See [vLLM docs](https://vllm.readthedocs.io/en/latest/getting_started/quickstart.html).
 ```text
 (h2ollm) ubuntu@cloudvm:~/h2ogpt$ python -m vllm.entrypoints.openai.api_server --help
-usage: api_server.py [-h] [--host HOST] [--port PORT] [--allow-credentials] [--allowed-origins ALLOWED_ORIGINS] [--allowed-methods ALLOWED_METHODS] [--allowed-headers ALLOWED_HEADERS] [--served-model-name SERVED_MODEL_NAME] [--model MODEL] [--tokenizer TOKENIZER]
-                     [--tokenizer-mode {auto,slow}] [--download-dir DOWNLOAD_DIR] [--use-np-weights] [--use-dummy-weights] [--dtype {auto,half,bfloat16,float}] [--worker-use-ray] [--pipeline-parallel-size PIPELINE_PARALLEL_SIZE]
-                     [--tensor-parallel-size TENSOR_PARALLEL_SIZE] [--block-size {8,16,32}] [--seed SEED] [--swap-space SWAP_SPACE] [--gpu-memory-utilization GPU_MEMORY_UTILIZATION] [--max-num-batched-tokens MAX_NUM_BATCHED_TOKENS] [--max-num-seqs MAX_NUM_SEQS]
-                     [--disable-log-stats] [--engine-use-ray] [--disable-log-requests]
+usage: api_server.py [-h] [--host HOST] [--port PORT] [--allow-credentials] [--allowed-origins ALLOWED_ORIGINS] [--allowed-methods ALLOWED_METHODS] [--allowed-headers ALLOWED_HEADERS] [--served-model-name SERVED_MODEL_NAME] [--model MODEL]
+                     [--tokenizer TOKENIZER] [--revision REVISION] [--tokenizer-mode {auto,slow}] [--trust-remote-code] [--download-dir DOWNLOAD_DIR] [--load-format {auto,pt,safetensors,npcache,dummy}]
+                     [--dtype {auto,half,float16,bfloat16,float,float32}] [--max-model-len MAX_MODEL_LEN] [--worker-use-ray] [--pipeline-parallel-size PIPELINE_PARALLEL_SIZE] [--tensor-parallel-size TENSOR_PARALLEL_SIZE] [--block-size {8,16,32}]
+                     [--seed SEED] [--swap-space SWAP_SPACE] [--gpu-memory-utilization GPU_MEMORY_UTILIZATION] [--max-num-batched-tokens MAX_NUM_BATCHED_TOKENS] [--max-num-seqs MAX_NUM_SEQS] [--disable-log-stats] [--quantization {awq,None}]
+                     [--engine-use-ray] [--disable-log-requests] [--max-log-len MAX_LOG_LEN]
 
 vLLM OpenAI-Compatible RESTful API server.
 
@@ -285,14 +374,20 @@ options:
   --model MODEL         name or path of the huggingface model to use
   --tokenizer TOKENIZER
                         name or path of the huggingface tokenizer to use
+  --revision REVISION   the specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.
   --tokenizer-mode {auto,slow}
                         tokenizer mode. "auto" will use the fast tokenizer if available, and "slow" will always use the slow tokenizer.
+  --trust-remote-code   trust remote code from huggingface
   --download-dir DOWNLOAD_DIR
                         directory to download and load the weights, default to the default cache dir of huggingface
-  --use-np-weights      save a numpy copy of model weights for faster loading. This can increase the disk usage by up to 2x.
-  --use-dummy-weights   use dummy values for model weights
-  --dtype {auto,half,bfloat16,float}
+  --load-format {auto,pt,safetensors,npcache,dummy}
+                        The format of the model weights to load. "auto" will try to load the weights in the safetensors format and fall back to the pytorch bin format if safetensors format is not available. "pt" will load the weights in the pytorch
+                        bin format. "safetensors" will load the weights in the safetensors format. "npcache" will load the weights in pytorch format and store a numpy cache to speed up the loading. "dummy" will initialize the weights with random
+                        values, which is mainly for profiling.
+  --dtype {auto,half,float16,bfloat16,float,float32}
                         data type for model weights and activations. The "auto" option will use FP16 precision for FP32 and FP16 models, and BF16 precision for BF16 models.
+  --max-model-len MAX_MODEL_LEN
+                        model context length. If unspecified, will be automatically derived from the model.
   --worker-use-ray      use Ray for distributed serving, will be automatically set when using more than 1 GPU
   --pipeline-parallel-size PIPELINE_PARALLEL_SIZE, -pp PIPELINE_PARALLEL_SIZE
                         number of pipeline stages
@@ -310,9 +405,13 @@ options:
   --max-num-seqs MAX_NUM_SEQS
                         maximum number of sequences per iteration
   --disable-log-stats   disable logging statistics
+  --quantization {awq,None}, -q {awq,None}
+                        Method used to quantize the weights
   --engine-use-ray      use Ray to start the LLM engine in a separate process as the server process.
   --disable-log-requests
                         disable logging requests
+  --max-log-len MAX_LOG_LEN
+                        max number of prompt characters or prompt ID numbers being printed in log. Default: unlimited.
 ```
 
 CURL test:
@@ -331,7 +430,7 @@ If started OpenAI-compliant server, then run h2oGPT:
 ```bash
 python generate.py --inference_server="vllm:0.0.0.0:5000" --base_model=h2oai/h2ogpt-oasst1-falcon-40b --langchain_mode=UserData
 ```
-Note: `vllm_chat` ChatCompletion is not supported by vLLM project.
+Note: `vllm_chat` ChatCompletion is not supported by vLLM project.  If add `https://` or `http://` as prefix to IP address for vLLM, then also need to add rest of full address with `/v1` at end
 
 Note vLLM has bug in stopping sequence that is does not return the last token, unlike OpenAI, so a hack is in place for `prompt_type=human_bot`, and other prompts may need similar hacks.  See `fix_text()` in `src/prompter.py`.
 
@@ -354,7 +453,27 @@ Replicate is **not** recommended for private document question-answer, but suffi
 
 Issues:
 * `requests.exceptions.JSONDecodeError: Expecting value: line 1 column 1 (char 0)`
-  * Sometimes Replicate sends back bad json, seems randomly occurs.
+* Sometimes Replicate sends back bad json, seems randomly occurs.
+
+
+### LLama.cpp HTTP server
+
+If you have any other OpenAI compatible chat completion endpoint, you should use vllm_chat way.  E.g. llama.cpp http server: https://github.com/ggerganov/llama.cpp/tree/master/examples/server
+
+## AWS SageMaker Endpoint
+
+h2oGPT code is based upon [LangChain Code](https://python.langchain.com/docs/integrations/llms/sagemaker) but with various fixes, handling of access keys, and handling for LLama-2 Chat type model.  See also https://boto3.amazonaws.com/v1/documentation/api/latest/guide/credentials.html .
+
+This presumes one has set up an [AWS SageMaker endpoint](aws_sagemaker_endpoint_setup.pdf) (from [here](https://medium.com/@mudassir.aqeel24/deploy-llama2-7b-on-aws-easiest-method-f76d71a51684)) and that you are able to view events in the AWS console to confirm things are working or debug if not.
+
+Streaming is not yet supported in LangChain version of SageMaker, see [Streaming Docs](https://aws.amazon.com/blogs/machine-learning/elevating-the-generative-ai-experience-introducing-streaming-support-in-amazon-sagemaker-hosting/).
+
+To use AWS SageMaker Chat endpoint, e.g. with LLaMa-2 Chat, pass to h2oGPT `--inference_server=sagemaker_chat:<endpointname>:<region>` for `<endpointname>` of the endpoint's name and `<region>` the region (e.g. `us-east-2`), e.g.
+```bash
+export AWS_ACCESS_KEY_ID=<...>
+export AWS_SECRET_ACCESS_KEY=<...>
+python generate.py --inference_server=sagemaker_chat:<endpointname>:<region> --base_model=h2oai/h2ogpt-4096-llama2-7b-chat
+```
 
 ## h2oGPT start-up vs. in-app selection
 
@@ -405,6 +524,14 @@ sleep 60
 python generate.py --model_lock="[{'inference_server':'http://192.168.1.xx:5000','base_model':'h2oai/h2ogpt-gm-oasst1-en-2048-open-llama-13b'},{'inference_server':'openai_chat','base_model':'gpt-3.5-turbo'}]" --model_lock_columns=2
 ```
 where be sure to replace `192.168.1.xx` with your IP address.  Note the ampersand so the first call is in background.  The sleep gives time for the first one to come up.  The above is as if ran on single system, but you can run on any other system separate generates of any number.
+
+### Visible Models
+
+At startup, models can be selected as visible out of all those in the model lock, e.g.:
+```
+export vis="['h2oai/h2ogpt-4096-llama2-70b-chat','h2oai/h2ogpt-4096-llama2-13b-chat','HuggingFaceH4/zephyr-7b-alpha','gpt-3.5-turbo-0613']"
+python generate.py --save_dir=saveall_gpt --model_lock="$MODEL_LOCK" --model_lock_columns=3 --auth_filename=all_auth.json --gradio_size=small --height=400 --score_model=None --max_max_new_tokens=2048 --max_new_tokens=1024 --visible_models="$vis" &>> logs.all.gradio_chat.txt &
+```
 
 ### System info from gradio server
 

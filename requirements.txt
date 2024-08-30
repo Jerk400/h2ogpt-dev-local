@@ -1,71 +1,100 @@
-# for generate (gradio server) and finetune
-datasets==2.13.0
-sentencepiece==0.1.99
-gradio==3.39.0
-huggingface_hub==0.16.4
-appdirs==1.4.4
-fire==0.5.0
-docutils==0.20.1
-torch==2.0.1; sys_platform != "darwin" and platform_machine != "arm64"
-evaluate==0.4.0
-rouge_score==0.1.2
-sacrebleu==2.3.1
-scikit-learn==1.2.2
-# optional:
+# no websockets, more cloud friendly
+# able to make gradio clean-up states
+
+# gradio @ https://h2o-release.s3.amazonaws.com/h2ogpt/gradio-4.25.0-py3-none-any.whl
+# gradio_client @ https://h2o-release.s3.amazonaws.com/h2ogpt/gradio_client-0.15.0-py3-none-any.whl
+#gradio @ https://h2o-release.s3.amazonaws.com/h2ogpt/gradio-4.20.1-py3-none-any.whl
+#gradio_client==0.11.0
+gradio @ https://h2o-release.s3.amazonaws.com/h2ogpt/gradio-4.26.0-py3-none-any.whl
+gradio_client @ https://h2o-release.s3.amazonaws.com/h2ogpt/gradio_client-0.15.1-py3-none-any.whl
+
+uvicorn[standard]
+gunicorn
+fastapi-utils
+sse_starlette>=1.8.2
+# consrained by tokenizers etc.:
+huggingface_hub>=0.23.3
+appdirs>=1.4.4
+fire>=0.5.0
+docutils>=0.20.1
+torch==2.2.1; sys_platform != "darwin" and platform_machine != "arm64"
+torch==2.3.1; sys_platform == "darwin" and platform_machine == "arm64"
+evaluate>=0.4.0
+rouge_score>=0.1.2
+sacrebleu>=2.3.1
+scikit-learn>=1.2.2
+# optional (need to uncomment code in gradio_runner.py for import of better_profanity)
 # alt-profanity-check==1.2.2
 # better-profanity==0.7.0
-numpy==1.24.3
-pandas==2.0.2
-matplotlib==3.7.1
-loralib==0.1.1
-bitsandbytes==0.39.0
-accelerate==0.20.3
-peft==0.4.0
-# 4.31.0+ breaks load_in_8bit=True (https://github.com/huggingface/transformers/issues/25026)
-transformers==4.30.2
-tokenizers==0.13.3
-APScheduler==3.10.1
+numpy>=1.23.4,<2.0
+pandas>=2.0.2
+matplotlib>=3.7.1
+
+# transformers
+loralib>=0.1.2
+bitsandbytes>=0.43.1; sys_platform != "darwin" and platform_machine != "arm64"
+#bitsandbytes downgraded because of Mac M1/M2 support issue. See https://github.com/axolotl-ai-cloud/axolotl/issues/1436
+bitsandbytes==0.42.0; sys_platform == "darwin" and platform_machine == "arm64"
+accelerate>=0.30.1
+peft>=0.7.0
+transformers>=4.43.2
+jinja2>=3.1.0
+tokenizers>=0.19.0
+hf_transfer>=0.1.6
+optimum>=1.17.1
+datasets>=2.18.0
+sentencepiece>=0.2.0
+
+APScheduler>=3.10.1
 
 # optional for generate
-pynvml==11.5.0
-psutil==5.9.5
-boto3==1.26.101
-botocore==1.29.101
-
-# optional for finetune
-tensorboard==2.13.0
-neptune==1.2.0
-
-# for gradio client
-gradio_client==0.3.0
-beautifulsoup4==4.12.2
-markdown==3.4.3
+pynvml>=11.5.0
+psutil>=5.9.5
+boto3>=1.26.101
+botocore>=1.29.101
+beautifulsoup4>=4.12.2
+markdown>=3.4.3
 
 # data and testing
-pytest==7.2.2
-pytest-xdist==3.2.1
-nltk==3.8.1
-textstat==0.7.3
+pytest>=7.2.2
+pytest-xdist>=3.2.1
+nltk>=3.8.1
+textstat>=0.7.3
 # pandoc==2.3
-pypandoc==1.11; sys_platform == "darwin" and platform_machine == "arm64"
-pypandoc_binary==1.11; platform_machine == "x86_64"
-pypandoc_binary==1.11; sys_platform == "win32"
-openpyxl==3.1.2
-lm_dataformat==0.0.20
-bioc==2.0
+pypandoc>=1.11; sys_platform == "darwin" and platform_machine == "arm64"
+pypandoc_binary>=1.11; platform_machine == "x86_64"
+pypandoc_binary>=1.11; platform_system == "Windows"
+python-magic-bin>=0.4.14; platform_system == "Windows"
+openpyxl>=3.1.2
+lm_dataformat>=0.0.20
+bioc>=2.0
+
+# for HF embeddings
+sentence_transformers>=3.0.1
+InstructorEmbedding @ https://h2o-release.s3.amazonaws.com/h2ogpt/InstructorEmbedding-1.0.1-py3-none-any.whl
+sentence_transformers_old @ https://h2o-release.s3.amazonaws.com/h2ogpt/sentence_transformers_old-2.2.2-py3-none-any.whl
 
 # falcon
-einops==0.6.1
-instructorembedding==1.0.1
+einops>=0.6.1
 
 # for gpt4all .env file, but avoid worrying about imports
-python-dotenv==1.0.0
+python-dotenv>=1.0.0
 
-text-generation==0.6.0
+json_repair>=0.21.0
+
+text-generation>=0.7.0
+
 # for tokenization when don't have HF tokenizer
-tiktoken==0.4.0
+tiktoken>=0.5.2
+
+# optional: for OpenAI endpoint
+openai>=1.40.1
+
+# for image metadata
+pyexiv2
 
 requests>=2.31.0
+httpx>=0.24.1
 urllib3>=1.26.16
 filelock>=3.12.2
 joblib>=1.3.1
